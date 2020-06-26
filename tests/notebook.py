@@ -189,6 +189,7 @@ class TestBuildNotebook(tests.TestCase):
 
 		script = folder.file('mount.py')
 		script.write('''\
+### NOTE: The script fails when called twice - this is intentional ###
 import os
 import sys
 notebook = sys.argv[1]
@@ -220,12 +221,11 @@ mount=%s %s
 
 		nbid = None
 		for uri, path in (
-			(self.notebookdir.uri, None),
-			(self.notebookdir.uri, None), # repeat to check uniqueness
+			(self.notebookdir.uri, None), # first run triggers automount
+			(self.notebookdir.uri, None), # repeat to check automount & check uniqueness
 			(self.notebookdir.file('notebook.zim').uri, None),
 			(self.notebookdir.file('foo/bar.txt').uri, Path('foo:bar')),
 		):
-			#~ print(">>", uri)
 			info = NotebookInfo(uri)
 			nb, p = build_notebook(info)
 			self.assertEqual(nb.folder.path, self.notebookdir.path)
@@ -426,7 +426,7 @@ class TestNotebook(tests.TestCase):
 			# part of the test - see if caching of page objects doesn't bite
 
 		with tests.LoggingFilter('zim.notebook', message='Number of links'):
-			self.notebook.rename_page(Path('Test:wiki'), 'foo')
+			self.notebook.move_page(Path('Test:wiki'), Path('Test:foo'))
 		page = self.notebook.get_page(Path('Test:wiki'))
 		self.assertFalse(page.hascontent)
 		page = self.notebook.get_page(Path('Test:foo'))
@@ -438,7 +438,7 @@ class TestNotebook(tests.TestCase):
 
 	def testCaseSensitiveMove(self):
 		from zim.notebook.index import LINK_DIR_BACKWARD
-		self.notebook.rename_page(Path('Test:foo'), 'Foo')
+		self.notebook.move_page(Path('Test:foo'), Path('Test:Foo'))
 
 		pages = list(self.notebook.pages.list_pages(Path('Test')))
 		self.assertNotIn(Path('Test:foo'), pages)
@@ -954,6 +954,32 @@ class TestUpdateLinksOnMovePage(tests.TestCase):
 				[('B', 'C'), ('B', 'C:A1'), ('B', 'D')]
 			)
 		)
+		
+	def testMovePlaceholder(self):
+		self.movePage(
+			pre=(
+				{'A': 'test 123\n', 'B': '[[C]]\n'},
+				[('B', 'C')]
+			),
+			move=('C', 'A'),
+			post=(
+				{'A': 'test 123\n', 'B': '[[A]]\n'},
+				[('B', 'A')]
+			)
+		)
+
+	def testRenamePlaceholder(self):
+		self.movePage(
+			pre=(
+				{'A': 'test 123\n', 'B': '[[C]]\n'},
+				[('B', 'C')]
+			),
+			move=('C', 'D'),
+			post=(
+				{'A': 'test 123\n', 'B': '[[D]]\n', 'D': ''},
+				[('B', 'D')]
+			)
+		)
 
 
 class TestPath(tests.TestCase):
@@ -962,17 +988,25 @@ class TestPath(tests.TestCase):
 	def generator(self, name):
 		return Path(name)
 
-	def runTest(self):
-		'''Test Path object'''
+	def testValidPageName(self):
+		for name in ('test', 'test this', 'test (this)', 'test:this (2)', '1) foo'):
+			Path.assertValidPageName(name) # raises if error
+			self.assertEqual(Path.makeValidPageName(name), name)
 
-		for name in ('test', 'test this', 'test (this)', 'test:this (2)'):
-			Path.assertValidPageName(name)
-
-		for name in (':test', '+test', 'foo:_bar', 'foo::bar', 'foo#bar'):
+		for name, validname in (
+			(':test', 'test'),
+			('+test', 'test'),
+			('foo:_bar', 'foo:bar'),
+			('foo::bar', 'foo:bar'),
+			('foo#bar', 'foobar'),
+			(') foo', 'foo')
+		):
 			self.assertRaises(AssertionError, Path.assertValidPageName, name)
+			self.assertEqual(Path.makeValidPageName(name), validname)
+			Path.assertValidPageName(validname) # raises if error
 
-		#~ for input, name in ():
-			#~ self.assertEqual(Path.makeValidPageName(input), name)
+	def testPathObject(self):
+		'''Test Path object'''
 
 		for name, namespace, basename in [
 			('Test:foo', 'Test', 'foo'),
@@ -1057,10 +1091,8 @@ class TestPage(TestPath):
 		folder = MockFile('/mock/test/page/')
 		return Page(Path(name), False, file, folder)
 
-	def testMain(self):
+	def testPageObject(self):
 		'''Test Page object'''
-		TestPath.runTest(self)
-
 		tree = ParseTree().fromstring('''\
 <zim-tree>
 <link href='foo:bar'>foo:bar</link>
@@ -1099,10 +1131,10 @@ class TestPage(TestPath):
 		page = Page(Path('Foo'), False, file, folder)
 
 		tree = ParseTree().fromstring('<zim-tree></zim-tree>')
-		tree.set_heading("Foo")
+		tree.set_heading_text("Foo")
 		page.set_parsetree(tree)
 		self.assertTrue(page.heading_matches_pagename())
-		tree.set_heading("Bar")
+		tree.set_heading_text("Bar")
 		page.set_parsetree(tree)
 		self.assertFalse(page.heading_matches_pagename())
 

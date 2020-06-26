@@ -20,11 +20,40 @@ from tests.mainwindow import setUpMainWindow
 
 class TestPageIndexPlugin(tests.TestCase):
 
-	def runTest(self):
-		plugin = PluginManager.load_plugin('pageindex')
-		window = setUpMainWindow(self.setUpNotebook())
-		extension = find_extension(window.pageview, PageIndexPageViewExtension)
-		self.assertIsNotNone(extension)
+	def setUp(self):
+		self.plugin = PluginManager.load_plugin('pageindex')
+		self.window = setUpMainWindow(self.setUpNotebook(content=tests.FULL_NOTEBOOK))
+		self.extension = find_extension(self.window.pageview, PageIndexPageViewExtension)
+		assert self.extension is not None
+
+	def do_expandcollapse(self, autoexpand, autocollapse):
+		self.plugin.preferences.update({'autoexpand': autoexpand, 'autocollapse': autocollapse})
+		treeview = self.extension.treeview
+		treepath = treeview.get_model().find(Path('Test:foo'))
+
+		treeview.collapse_all()
+		self.assertFalse(treeview.row_expanded(treepath))
+
+		self.window.open_page(Path('Test:foo:bar'))
+		if autoexpand:
+			self.assertTrue(treeview.row_expanded(treepath))
+		else:
+			self.assertFalse(treeview.row_expanded(treepath))
+
+		self.window.open_page(Path('Test'))
+		if autoexpand and not autocollapse:
+			self.assertTrue(treeview.row_expanded(treepath))
+		else:
+			self.assertFalse(treeview.row_expanded(treepath))
+
+	def testAutoExpandAndCollapse(self):
+		self.do_expandcollapse(True, True)
+
+	def testNoAutoExpand(self):
+		self.do_expandcollapse(True, False)
+
+	def testAutoExpandNoCollapse(self):
+		self.do_expandcollapse(False, False)
 
 
 def init_model_validator_wrapper(test, model):
@@ -275,3 +304,64 @@ class TestPageTreeView(tests.TestCase):
 
 		self.assertGreater(self.model.on_iter_n_children(None), 0)
 		# TODO: assert something on the view ?
+
+	def testRestoreExpand(self):
+		treeview = self.treeview
+		treepath = treeview.get_model().find(Path('Test:foo'))
+		parent = treepath.copy()
+		parent.up()
+		treeview.collapse_all()
+
+		self.assertIsNone(treeview.get_expanded_path(treepath))
+		self.assertFalse(treeview.row_expanded(parent))
+
+		treeview.expand_to_path(parent)
+		self.assertEqual(treeview.get_expanded_path(treepath).to_string(), parent.to_string())
+		self.assertTrue(treeview.row_expanded(parent))
+		self.assertFalse(treeview.row_expanded(treepath))
+
+		treeview.expand_to_path(treepath)
+		self.assertEqual(treeview.get_expanded_path(treepath).to_string(), treepath.to_string())
+		self.assertTrue(treeview.row_expanded(treepath))
+
+		treeview.restore_expanded_path(treepath, treepath)
+		self.assertTrue(treeview.row_expanded(treepath))
+
+		treeview.restore_expanded_path(treepath, parent)
+		self.assertTrue(treeview.row_expanded(parent))
+		self.assertFalse(treeview.row_expanded(treepath))
+
+		treeview.restore_expanded_path(treepath, None)
+		self.assertFalse(treeview.row_expanded(parent))
+
+	def testDragAndDropCallbacks(self):
+		# Don't know how to test real drag and drop, but at least test the callbacks
+		self._testDragAndDropCallbacks(workaround=False)
+
+	def testDragAndDropCallbacksWithWorkaround(self):
+		# Testing work around for issue #390
+		self._testDragAndDropCallbacks(workaround=True)
+
+	def _testDragAndDropCallbacks(self, workaround):
+		treeview = self.treeview
+
+		mocktarget = tests.MockObject(name=INTERNAL_PAGELIST_TARGET_NAME)
+		mockselectiondata = tests.MockObject(get_target=mocktarget)
+
+		treeview.do_drag_data_get(None, mockselectiondata, None, None)
+		self.assertEqual(mockselectiondata.mock_calls[-1], ('set', mocktarget, 8, b'Test\r\n'))
+
+		if workaround:
+			self.assertEqual(zim.gui.clipboard._internal_selection_data, b'Test\r\n')
+			mockselectiondata.mock_method('get_data', None)
+		else:
+			zim.gui.clipboard._internal_selection_data = None
+			mockselectiondata.mock_method('get_data', b'Test\r\n')
+
+		treepath = treeview.get_model().find(Path('Foo'))
+		position = Gtk.TreeViewDropPosition.INTO_OR_BEFORE
+		treeview.get_dest_row_at_pos = lambda x, y: (treepath, position) # MOCK method
+
+		with tests.LoggingFilter('zim.notebook', message='Number of links after move'):
+			context = tests.MockObject()
+			treeview.do_drag_data_received(context, None, None, mockselectiondata, None, None)

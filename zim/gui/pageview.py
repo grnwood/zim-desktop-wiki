@@ -1,5 +1,6 @@
+# -*- coding: utf-8 -*-
 
-# Copyright 2008-2019 Jaap Karssenberg <jaap.karssenberg@gmail.com>
+# Copyright 2008-2020 Jaap Karssenberg <jaap.karssenberg@gmail.com>
 
 '''This module contains the main text editor widget.
 It includes all classes needed to display and edit a single page as well
@@ -36,10 +37,11 @@ from zim.errors import Error
 from zim.config import String, Float, Integer, Boolean, Choice, ConfigManager
 from zim.notebook import Path, interwiki_link, HRef, PageNotFoundError
 from zim.notebook.operations import NotebookState, ongoing_operation
-from zim.parsing import link_type, Re, url_re
+from zim.parsing import link_type, Re
 from zim.formats import get_format, increase_list_iter, \
 	ParseTree, ElementTreeModule, OldParseTreeBuilder, \
 	BULLET, CHECKED_BOX, UNCHECKED_BOX, XCHECKED_BOX, MIGRATED_BOX, LINE, OBJECT
+from zim.formats.wiki import url_re, match_url
 from zim.actions import get_gtk_actiongroup, action, toggle_action
 from zim.gui.widgets import \
 	Dialog, FileDialog, QuestionDialog, ErrorDialog, \
@@ -49,7 +51,6 @@ from zim.gui.widgets import \
 from zim.gui.applications import OpenWithMenu, open_url, open_file, edit_config_file
 from zim.gui.clipboard import Clipboard, SelectionClipboard, \
 	textbuffer_register_serialize_formats
-from zim.gui.uiactions import attach_file
 from zim.gui.insertedobjects import \
 	InsertedObjectWidget, UnknownInsertedObject, UnknownInsertedImageObject, \
 	POSITION_BEGIN, POSITION_END
@@ -77,7 +78,7 @@ class LineSeparator(InsertedObjectWidget):
 def is_line(line):
 	'''Function used for line autoformatting.'''
 	length = len(line)
-	return (line == '-' * length) and (length > 4)
+	return (line == '-' * length) and (length >= 3)
 
 
 STOCK_CHECKED_BOX = 'zim-checked-box'
@@ -125,7 +126,7 @@ KEYVALS_BACKSPACE = list(map(Gdk.keyval_from_name, ('BackSpace',)))
 KEYVALS_TAB = list(map(Gdk.keyval_from_name, ('Tab', 'KP_Tab')))
 KEYVALS_LEFT_TAB = list(map(Gdk.keyval_from_name, ('ISO_Left_Tab',)))
 
-#~ CHARS_END_OF_WORD = (' ', ')', '>', '.', '!', '?')
+# ~ CHARS_END_OF_WORD = (' ', ')', '>', '.', '!', '?')
 CHARS_END_OF_WORD = ('\t', ' ', ')', '>', ';')
 KEYVALS_END_OF_WORD = list(map(
 	Gdk.unicode_to_keyval, list(map(ord, CHARS_END_OF_WORD)))) + KEYVALS_TAB
@@ -228,6 +229,9 @@ _is_link_tag = lambda tag: _is_zim_tag(tag) and tag.zim_type == 'link'
 _is_not_link_tag = lambda tag: not (_is_zim_tag(tag) and tag.zim_type == 'link')
 _is_tag_tag = lambda tag: _is_zim_tag(tag) and tag.zim_type == 'tag'
 _is_not_tag_tag = lambda tag: not (_is_zim_tag(tag) and tag.zim_type == 'tag')
+_is_inline_nesting_tag = lambda tag: _is_zim_tag(tag) and tag.zim_tag in TextBuffer._nesting_style_tags or tag.zim_type == 'link'
+_is_non_nesting_tag = lambda tag: hasattr(tag, 'zim_tag') and tag.zim_tag in ('pre', 'code', 'tag')
+_is_link_tag_without_href = lambda tag: _is_link_tag(tag) and not tag.zim_attrib['href']
 
 PIXBUF_CHR = '\uFFFC'
 
@@ -235,7 +239,7 @@ PIXBUF_CHR = '\uFFFC'
 SCROLL_TO_MARK_MARGIN = 0.2
 
 # Regexes used for autoformatting
-heading_re = Re(r'^(={2,7})\s*(.*)\s*(\1)?$')
+heading_re = Re(r'^(={2,7})\s*(.*?)(\s=+)?$')
 page_re = Re(r'''(
 	  [\w\.\-\(\)]*(?: :[\w\.\-\(\)]{2,} )+:?
 	| \+\w[\w\.\-\(\)]+(?: :[\w\.\-\(\)]{2,} )*:?
@@ -248,11 +252,18 @@ file_re = Re(r'''(
 	| /[^/\s]
 )\S*$''', re.X | re.U) # ~xxx/ or ~name/xxx or ../xxx  or ./xxx  or /xxx
 
-markup_re = {'style-strong': Re(r'(\*{2})(.*)\1'),
-	'style-emphasis': Re(r'(\/{2})(.*)\1'),
-	'style-mark': Re(r'(_{2})(.*)\1'),
-	'style-pre': Re(r'(\'{2})(.*)\1'),
-	'style-strike': Re(r'(~{2})(.*)\1')}
+markup_re = [
+	# All ending in "$" to match last sequence on end-of-word
+	# the group captures the content to keep
+	('style-strong', re.compile(r'\*\*(.*)\*\*$')),
+	('style-emphasis', re.compile(r'\/\/(.*)\/\/$')),
+	('style-mark', re.compile(r'__(.*)__$')),
+	('style-code', re.compile(r'\'\'(.*)\'\'$')),
+	('style-strike', re.compile(r'~~(.*)~~$')),
+	('style-sup', re.compile(r'(?<=\w)\^\{(\S*)}$')),
+	('style-sup', re.compile(r'(?<=\w)\^(\S*)$')),
+	('style-sub', re.compile(r'(?<=\w)_\{(\S*)}$')),
+]
 
 tag_re = Re(r'^(@\w+)$', re.U)
 
@@ -492,7 +503,7 @@ class TextBuffer(Gtk.TextBuffer):
 	@signal: C{inserted-tree (start, end, tree, interactive)}:
 	Gives inserted tree after inserting it
 	@signal: C{textstyle-changed (style)}:
-	Emitted when textstyle at the cursor changes
+	Emitted when textstyle at the cursor changes, gets the list of text styles or None.
 	@signal: C{link-clicked ()}:
 	Emitted when a link is clicked; for example within a table cell
 	@signal: C{clear ()}:
@@ -558,12 +569,23 @@ class TextBuffer(Gtk.TextBuffer):
 		'find-highlight': {'background': 'magenta', 'foreground': 'white'},
 		'find-match': {'background': '#38d878', 'foreground': 'white'}
 	}
+
 	#: tags that can be mapped to named TextTags
 	_static_style_tags = (
+		# The order determines order of nesting, and order of formatting
+		# Indent-tags will be inserted before headings
+		# Link-tags and tag-tags will be inserted before "pre" and "code"
+		# search for "set_priority()" and "get_priority()" to see impact
 		'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-		'emphasis', 'strong', 'mark', 'strike',
-		'code', 'pre',
-		'sub', 'sup'
+		'emphasis', 'strong', 'mark', 'strike', 'sub', 'sup',
+		'pre', 'code',
+	)
+	_static_tag_before_links = 'sup' # link will be inserted with this prio +1
+	_static_tag_after_tags = 'pre' # link will be inserted with this prio
+
+	#: tags that can nest in any order
+	_nesting_style_tags = (
+		'emphasis', 'strong', 'mark', 'strike', 'sub', 'sup',
 	)
 
 	tag_attributes = {
@@ -571,6 +593,7 @@ class TextBuffer(Gtk.TextBuffer):
 		'scale': Float(None),
 		'style': ConfigDefinitionConstant(None, Pango.Style, 'PANGO_STYLE'),
 		'background': AsciiString(None),
+		'paragraph-background': AsciiString(None),
 		'foreground': AsciiString(None),
 		'strikethrough': Boolean(None),
 		'font': AsciiString(None),
@@ -592,7 +615,7 @@ class TextBuffer(Gtk.TextBuffer):
 		self.notebook = notebook
 		self.page = page
 		self._insert_tree_in_progress = False
-		self._check_edit_mode = False
+		self._deleted_editmode_mark = None
 		self._check_renumber = []
 		self._renumbering = False
 		self.user_action = UserActionContext(self)
@@ -613,6 +636,7 @@ class TextBuffer(Gtk.TextBuffer):
 
 		textbuffer_register_serialize_formats(self, notebook, page)
 
+		self.connect('delete-range', self.__class__.do_pre_delete_range)
 		self.connect_after('delete-range', self.__class__.do_post_delete_range)
 
 	#~ def do_begin_user_action(self):
@@ -621,11 +645,9 @@ class TextBuffer(Gtk.TextBuffer):
 
 	def do_end_user_action(self):
 		#~ print('<<<< USER ACTION')
-		if self._check_edit_mode:
-			self.update_editmode()
-			# This flag can e.g. indicate a delete happened in this
-			# user action, but we did not yet update edit mode -
-			# so we do it here so we are all set for the next action
+		if self._deleted_editmode_mark is not None:
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
 
 		if True: # not self._renumbering:
 			lines = list(self._check_renumber)
@@ -645,8 +667,11 @@ class TextBuffer(Gtk.TextBuffer):
 		self.emit('clear')
 
 	def do_clear(self):
-		self._editmode_tags = []
 		self.delete(*self.get_bounds())
+		if self._deleted_editmode_mark is not None:
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
+		self._editmode_tags = []
 
 	def get_insert_iter(self):
 		'''Get a C{Gtk.TextIter} for the current cursor position'''
@@ -710,7 +735,7 @@ class TextBuffer(Gtk.TextBuffer):
 		@param interactive: Boolean which determines how current state
 		in the buffer is handled.
 		'''
-		#~ print('INSERT AT CURSOR', tree.tostring())
+		#print('INSERT AT CURSOR', tree.tostring())
 
 		# Check tree
 		root = tree._etree.getroot() # HACK - switch to new interface !
@@ -733,6 +758,10 @@ class TextBuffer(Gtk.TextBuffer):
 		if not interactive:
 			self._editmode_tags = []
 		tree.decode_urls()
+
+		if self._deleted_editmode_mark is not None:
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
 
 		# Actual insert
 		modified = self.get_modified()
@@ -784,10 +813,11 @@ class TextBuffer(Gtk.TextBuffer):
 
 	def do_end_insert_tree(self):
 		self._insert_tree_in_progress = False
-		self.emit('textstyle-changed', self.get_textstyle())
-			# emitting textstyle-changed is skipped while loading the tree
+		self.emit('textstyle-changed', self.get_textstyles())
 
-	def _insert_element_children(self, node, list_level=-1, list_type=None, list_start='0', raw=False):
+	# emitting textstyle-changed is skipped while loading the tree
+
+	def _insert_element_children(self, node, list_level=-1, list_type=None, list_start='0', raw=False, textstyles=[]):
 		# FIXME should load list_level from cursor position
 		#~ list_level = get_indent --- with bullets at indent 0 this is not bullet proof...
 		list_iter = list_start
@@ -801,7 +831,7 @@ class TextBuffer(Gtk.TextBuffer):
 			# and level=0 as different cases.
 			self._editmode_tags = list(filter(_is_not_indent_tag, self._editmode_tags))
 			if level is None:
-				return # Nothing more to do
+				return  # Nothing more to do
 
 			iter = self.get_insert_iter()
 			if not iter.starts_line():
@@ -811,7 +841,7 @@ class TextBuffer(Gtk.TextBuffer):
 					logger.warn('BUG: overlapping indent tags')
 				if tags and int(tags[0].zim_attrib['indent']) == level:
 					self._editmode_tags.append(tags[0])
-					return # Re-use tag
+					return  # Re-use tag
 
 			tag = self._get_indent_tag(level, bullet)
 				# We don't set the LTR / RTL direction here
@@ -838,7 +868,7 @@ class TextBuffer(Gtk.TextBuffer):
 				if element.text:
 					self.insert_at_cursor(element.text)
 
-				self._insert_element_children(element, list_level=list_level, raw=raw) # recurs
+				self._insert_element_children(element, list_level=list_level, raw=raw, textstyles=textstyles)  # recurs
 
 				set_indent(None)
 			elif element.tag in ('ul', 'ol'):
@@ -847,7 +877,8 @@ class TextBuffer(Gtk.TextBuffer):
 					level = int(element.attrib['indent'])
 				else:
 					level = list_level + 1
-				self._insert_element_children(element, list_level=level, list_type=element.tag, list_start=start, raw=raw) # recurs
+				self._insert_element_children(element, list_level=level, list_type=element.tag, list_start=start, raw=raw,
+											  textstyles=textstyles)  # recurs
 				set_indent(None)
 			elif element.tag == 'li':
 				force_line_start()
@@ -871,17 +902,31 @@ class TextBuffer(Gtk.TextBuffer):
 				if element.text:
 					self.insert_at_cursor(element.text)
 
-				self._insert_element_children(element, list_level=list_level, raw=raw) # recurs
+				self._insert_element_children(element, list_level=list_level, raw=raw, textstyles=textstyles)  # recurs
 				set_indent(None)
 
 				if not raw:
 					self.insert_at_cursor('\n')
 
 			elif element.tag == 'link':
-				self.set_textstyle(None) # Needed for interactive insert tree after paste
-				self.insert_link_at_cursor(element.text, **element.attrib)
+				self.set_textstyles(textstyles)  # reset Needed for interactive insert tree after paste
+				tag = self._create_link_tag('', **element.attrib)
+				self._editmode_tags = list(filter(_is_not_link_tag, self._editmode_tags)) + [tag]
+				linkstartpos = self.get_insert_iter().get_offset()
+				if element.text:
+					self.insert_at_cursor(element.text)
+				self._insert_element_children(element, list_level=list_level, raw=raw,
+											  textstyles=textstyles)  # recurs
+				linkstart = self.get_iter_at_offset(linkstartpos)
+				text = linkstart.get_text(self.get_insert_iter())
+				if element.attrib['href'] and text != element.attrib['href']:
+					# same logic in _create_link_tag, but need to check text after all child elements inserted
+					tag.zim_attrib['href'] = element.attrib['href']
+				else:
+					tag.zim_attrib['href'] = None
+				self._editmode_tags.pop()
 			elif element.tag == 'tag':
-				self.set_textstyle(None) # Needed for interactive insert tree after paste
+				self.set_textstyles(textstyles)  # reset Needed for interactive insert tree after paste
 				self.insert_tag_at_cursor(element.text, **element.attrib)
 			elif element.tag == 'img':
 				file = element.attrib['_src_file']
@@ -889,10 +934,10 @@ class TextBuffer(Gtk.TextBuffer):
 			elif element.tag == 'pre':
 				if 'indent' in element.attrib:
 					set_indent(int(element.attrib['indent']))
-				self.set_textstyle(element.tag)
+				self.set_textstyles([element.tag])
 				if element.text:
 					self.insert_at_cursor(element.text)
-				self.set_textstyle(None)
+				self.set_textstyles(None)
 				set_indent(None)
 			elif element.tag == 'table':
 				if 'indent' in element.attrib:
@@ -910,23 +955,35 @@ class TextBuffer(Gtk.TextBuffer):
 				set_indent(None)
 			else:
 				# Text styles
+				flushed = False
 				if element.tag == 'h':
 					force_line_start()
 					tag = 'h' + str(element.attrib['level'])
-					self.set_textstyle(tag)
+					self.set_textstyles([tag])
+					if element.text:
+						self.insert_at_cursor(element.text)
+					flushed = True
+					self._insert_element_children(element, list_level=list_level, raw=raw,
+												  textstyles=[tag])  # recurs
 				elif element.tag in self._static_style_tags:
-					self.set_textstyle(element.tag)
+					self.set_textstyles(textstyles + [element.tag])
+					if element.text:
+						self.insert_at_cursor(element.text)
+					flushed = True
+					self._insert_element_children(element, list_level=list_level, raw=raw,
+												  textstyles=textstyles + [element.tag])  # recurs
 				elif element.tag == '_ignore_':
 					# raw tree from undo can contain these
-					self._insert_element_children(element, list_level=list_level, raw=raw) # recurs
+					self._insert_element_children(element, list_level=list_level, raw=raw, textstyles=textstyles)  # recurs
 				else:
 					logger.debug("Unknown tag : %s, %s, %s", element.tag,
-								element.attrib, element.text)
+								 element.attrib, element.text)
 					assert False, 'Unknown tag: %s' % element.tag
 
-				if element.text:
+				if element.text and not flushed:
 					self.insert_at_cursor(element.text)
-				self.set_textstyle(None)
+
+				self.set_textstyles(textstyles)
 
 			if element.tail:
 				self.insert_at_cursor(element.tail)
@@ -951,28 +1008,35 @@ class TextBuffer(Gtk.TextBuffer):
 		@param href: the target (URL, pagename) of the link as string
 		@param attrib: any other link attributes
 		'''
+		if self._deleted_editmode_mark is not None:
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
+
 		tag = self._create_link_tag(text, href, **attrib)
-		self._editmode_tags = \
-			list(filter(_is_not_link_tag,
-				list(filter(_is_not_style_tag, self._editmode_tags)))) + [tag]
+		self._editmode_tags = list(filter(_is_not_link_tag, self._editmode_tags)) + [tag]
 		self.insert_at_cursor(text)
 		self._editmode_tags = self._editmode_tags[:-1]
 
 	def _create_link_tag(self, text, href, **attrib):
 		'''Creates an anonymouse TextTag for a link'''
+		# These are created after __init__, so higher priority for Formatting
+		# properties than any of the _static_style_tags
 		if isinstance(href, File):
 			href = href.uri
-		assert isinstance(href, str)
+		assert isinstance(href, str) or href is None
 
 		tag = self.create_tag(None, **self.tag_styles['link'])
-		tag.set_priority(0) # force links to be below styles
 		tag.zim_type = 'link'
 		tag.zim_tag = 'link'
 		tag.zim_attrib = attrib
-		if href == text:
+		if href == text or not href or href.isspace():
 			tag.zim_attrib['href'] = None
 		else:
 			tag.zim_attrib['href'] = href
+
+		prio_tag = self.get_tag_table().lookup('style-' + self._static_tag_before_links)
+		tag.set_priority(prio_tag.get_priority()+1)
+
 		return tag
 
 	def get_link_tag(self, iter):
@@ -985,13 +1049,13 @@ class TextBuffer(Gtk.TextBuffer):
 		# Explicitly left gravity, otherwise position behind the link
 		# would also be considered part of the link. Position before the
 		# link is included here.
-		for tag in iter.get_tags():
+		for tag in sorted(iter.get_tags(), key=lambda i: i.get_priority()):
 			if hasattr(tag, 'zim_type') and tag.zim_type == 'link':
 				return tag
 		else:
 			return None
 
-	def get_link_data(self, iter):
+	def get_link_data(self, iter, raw=False):
 		'''Get the link attributes for a link at a specific position, if any
 
 		@param iter: a C{Gtk.TextIter}
@@ -1003,9 +1067,12 @@ class TextBuffer(Gtk.TextBuffer):
 		if tag:
 			link = tag.zim_attrib.copy()
 			if link['href'] is None:
-				# Copy text content as href
-				start, end = self.get_tag_bounds(iter, tag)
-				link['href'] = start.get_text(end)
+				if raw:
+					link['href'] = ''
+				else:
+					# Copy text content as href
+					start, end = self.get_tag_bounds(iter, tag)
+					link['href'] = start.get_text(end)
 			return link
 		else:
 			return None
@@ -1040,21 +1107,29 @@ class TextBuffer(Gtk.TextBuffer):
 		@param text: The text for the tag
 		@param attrib: any other tag attributes
 		'''
+		if self._deleted_editmode_mark is not None:
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
+
 		tag = self._create_tag_tag(text, **attrib)
 		self._editmode_tags = \
-			list(filter(_is_not_tag_tag,
-				list(filter(_is_not_style_tag, self._editmode_tags)))) + [tag]
+			[t for t in self._editmode_tags if not _is_non_nesting_tag(t)] + [tag]
 		self.insert_at_cursor(text)
 		self._editmode_tags = self._editmode_tags[:-1]
 
 	def _create_tag_tag(self, text, **attrib):
 		'''Creates an annonymous TextTag for a tag'''
+		# These are created after __init__, so higher priority for Formatting
+		# properties than any of the _static_style_tags
 		tag = self.create_tag(None, **self.tag_styles['tag'])
-		tag.set_priority(0) # force tags to be below styles
 		tag.zim_type = 'tag'
 		tag.zim_tag = 'tag'
 		tag.zim_attrib = attrib
 		tag.zim_attrib['name'] = None
+
+		prio_tag = self.get_tag_table().lookup('style-' + self._static_tag_after_tags)
+		tag.set_priority(prio_tag.get_priority())
+
 		return tag
 
 	def get_tag_tag(self, iter):
@@ -1283,6 +1358,10 @@ class TextBuffer(Gtk.TextBuffer):
 		instead of calling this method directly.
 		'''
 		assert bullet in BULLETS or is_numbered_bullet_re.match(bullet), 'Bullet: >>%s<<' % bullet
+		if self._deleted_editmode_mark is not None:
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
+
 		if not raw:
 			insert = self.get_insert_iter()
 			assert insert.starts_line(), 'BUG: bullet not at line start'
@@ -1457,27 +1536,32 @@ class TextBuffer(Gtk.TextBuffer):
 
 			line += 1
 
-	def set_textstyle(self, name):
+	def set_textstyles(self, names):
 		'''Sets the current text format style.
 
-		@param name: the name of the format style
+		@param names: the name of the format style
 
 		This style will be applied to text inserted at the cursor.
-		Use C{set_textstyle(None)} to reset to normal text.
+		Use C{set_textstyles(None)} to reset to normal text.
 		'''
-		self._editmode_tags = list(filter(_is_not_style_tag, self._editmode_tags))
+		if self._deleted_editmode_mark is not None:
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
 
-		if not name is None:
-			tag = self.get_tag_table().lookup('style-' + name)
-			if _is_heading_tag(tag):
-				self._editmode_tags = \
-					list(filter(_is_not_indent_tag, self._editmode_tags))
-			self._editmode_tags.append(tag)
+		self._editmode_tags = list(filter(_is_not_style_tag, self._editmode_tags))  # remove all text styles first
+
+		if names:
+			for name in names:
+				tag = self.get_tag_table().lookup('style-' + name)
+				if _is_heading_tag(tag):
+					self._editmode_tags = \
+						list(filter(_is_not_indent_tag, self._editmode_tags))
+				self._editmode_tags.append(tag)
 
 		if not self._insert_tree_in_progress:
-			self.emit('textstyle-changed', name)
+			self.emit('textstyle-changed', names)
 
-	def get_textstyle(self):
+	def get_textstyles(self):
 		'''Get the name of the formatting style that will be applied
 		to newly inserted text
 
@@ -1486,21 +1570,19 @@ class TextBuffer(Gtk.TextBuffer):
 		'''
 		tags = list(filter(_is_style_tag, self._editmode_tags))
 		if tags:
-			assert len(tags) == 1, 'BUG: can not have multiple text styles'
-			return tags[0].get_property('name')[6:] # len('style-') == 6
+			# X not anymore assert len(tags) == 1, 'BUG: can not have multiple text styles'
+			return [tag.get_property('name')[6:] for tag in tags]  # len('style-') == 6
 		else:
-			return None
+			return []
 
 	def update_editmode(self):
-		'''Updates the text style and indenting applied to newly inderted
+		'''Updates the text style and indenting applied to newly indented
 		text based on the current cursor position
 
 		This method is triggered automatically when the cursor is moved,
 		but there are some cases where you may need to call it manually
 		to force a consistent state.
 		'''
-		self._check_edit_mode = False
-
 		bounds = self.get_selection_bounds()
 		if bounds:
 			# For selection we set editmode based on left hand side and looking forward
@@ -1515,13 +1597,7 @@ class TextBuffer(Gtk.TextBuffer):
 		if not tags == self._editmode_tags:
 			#~ print('>', [(t.zim_type, t.get_property('name')) for t in tags])
 			self._editmode_tags = tags
-			for tag in tags:
-				if tag.zim_type == 'style':
-					name = tag.get_property('name')[6:]
-					self.emit('textstyle-changed', name)
-					break
-			else:
-				self.emit('textstyle-changed', None)
+			self.emit('textstyle-changed', [tag.get_property('name')[6:] for tag in tags if tag.zim_type == 'style'])
 
 	def iter_get_zim_tags(self, iter):
 		'''Replacement for C{Gtk.TextIter.get_tags()} which returns
@@ -1538,7 +1614,7 @@ class TextBuffer(Gtk.TextBuffer):
 		the right and not inadvertently copy formatting from the
 		previous line which ends on the left.
 
-		This method is for exampel used by L{update_editmode()} to
+		This method is for example used by L{update_editmode()} to
 		determine which TextTags should be applied to newly inserted
 		text at at a specific location.
 
@@ -1604,10 +1680,14 @@ class TextBuffer(Gtk.TextBuffer):
 		@param name: the format style name
 		'''
 		if not self.get_has_selection():
-			if name == self.get_textstyle():
-				self.set_textstyle(None)
+			styles = self.get_textstyles()
+			if 'pre' in styles and name != 'pre':
+				pass # do not allow styles within verbatim block
+			elif name in styles:
+				styles.remove(name)
+				self.set_textstyles(styles)
 			else:
-				self.set_textstyle(name)
+				self.set_textstyles(styles + [name])
 		else:
 			with self.user_action:
 				start, end = self.get_selection_bounds()
@@ -1617,14 +1697,26 @@ class TextBuffer(Gtk.TextBuffer):
 						tag = self.get_tag_table().lookup('style-' + name)
 						if not self.whole_range_has_tag(tag, start, end):
 							start, end = self._fix_pre_selection(start, end)
-				elif name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-					for line in range(start.get_line(), end.get_line()+1):
-						self._remove_indent(line)
 
 				tag = self.get_tag_table().lookup('style-' + name)
 				had_tag = self.whole_range_has_tag(tag, start, end)
-				self.remove_textstyle_tags(start, end)
-				if not had_tag:
+				pre_tag = self.get_tag_table().lookup('style-pre')
+
+				if tag.zim_tag == "h":
+					self.smart_remove_tags(_is_heading_tag, start, end)
+					for line in range(start.get_line(), end.get_line()+1):
+						self._remove_indent(line)
+				elif tag.zim_tag in ('pre', 'code'):
+					self.smart_remove_tags(_is_non_nesting_tag, start, end)
+					if tag.zim_tag == 'pre':
+						self.smart_remove_tags(_is_link_tag, start, end)
+						self.smart_remove_tags(_is_style_tag, start, end)
+				elif self.range_has_tag(pre_tag, start, end):
+					return # do not allow formatting withing verbatim block
+
+				if had_tag:
+					self.remove_tag(tag, start, end)
+				else:
 					self.apply_tag(tag, start, end)
 				self.set_modified(True)
 
@@ -1662,7 +1754,7 @@ class TextBuffer(Gtk.TextBuffer):
 		@param end: a C{Gtk.TextIter}
 		'''
 		if tag in start.get_tags() \
-		and tag in self.iter_get_zim_tags(end):
+				and tag in self.iter_get_zim_tags(end):
 			iter = start.copy()
 			if iter.forward_to_tag_toggle(tag):
 				return iter.compare(end) >= 0
@@ -1680,7 +1772,7 @@ class TextBuffer(Gtk.TextBuffer):
 		'''
 		# test right gravity for start iter, but left gravity for end iter
 		if tag in start.get_tags() \
-		or tag in self.iter_get_zim_tags(end):
+				or tag in self.iter_get_zim_tags(end):
 			return True
 		else:
 			iter = start.copy()
@@ -1703,7 +1795,7 @@ class TextBuffer(Gtk.TextBuffer):
 		'''
 		# test right gravity for start iter, but left gravity for end iter
 		if any(filter(func, start.get_tags())) \
-		or any(filter(func, self.iter_get_zim_tags(end))):
+				or any(filter(func, self.iter_get_zim_tags(end))):
 			return True
 		else:
 			iter = start.copy()
@@ -1779,7 +1871,7 @@ class TextBuffer(Gtk.TextBuffer):
 
 	def _get_indent_tag(self, level, bullet=None, dir='LTR'):
 		if dir is None:
-			dir = 'LTR' # Assume western default direction - FIXME need system default
+			dir = 'LTR'  # Assume western default direction - FIXME need system default
 		name = 'indent-%s-%i' % (dir, level)
 		if bullet:
 			name += '-' + bullet
@@ -1828,6 +1920,10 @@ class TextBuffer(Gtk.TextBuffer):
 			tag.zim_type = 'indent'
 			tag.zim_tag = 'indent'
 			tag.zim_attrib = {'indent': level, '_bullet': (bullet is not None)}
+
+			# Set the prioriy below any _static_style_tags
+			tag.set_priority(0)
+
 		return tag
 
 	def _find_base_dir(self, line):
@@ -1994,6 +2090,14 @@ class TextBuffer(Gtk.TextBuffer):
 		'''Signal handler for insert-text signal'''
 		#~ print('INSERT', string)
 
+		if self._deleted_editmode_mark is not None:
+			# Use mark if we are the same postion, clear it anyway
+			markiter = self.get_iter_at_mark(self._deleted_editmode_mark)
+			if iter.equal(markiter):
+				self._editmode_tags = self._deleted_editmode_mark.editmode_tags
+			self.delete_mark(self._deleted_editmode_mark)
+			self._deleted_editmode_mark = None
+
 		def end_or_protect_tags(string, length):
 			tags = list(filter(_is_tag_tag, self._editmode_tags))
 			if tags:
@@ -2092,19 +2196,21 @@ class TextBuffer(Gtk.TextBuffer):
 		for tag in filter(_is_indent_tag, self._editmode_tags):
 			self.apply_tag(tag, start, iter)
 
-	def do_post_delete_range(self, start, end):
-		# Post handler to hook _do_lines_merged and do some logic
-		# when deleting bullets
-		#
-		# Implementation detail:
+	def do_pre_delete_range(self, start, end):
 		# (Interactive) deleting a formatted word with <del>, or <backspace>
 		# should drop the formatting, however selecting a formatted word and
 		# than typing to replace it, should keep formatting
-		# Since we don't know at this point what scenario we are part
-		# off, we do NOT touch the editmode. However we do set a flag
-		# that edit mode needs to be checked at the end of the user
-		# action.
-		#
+		# Therefore we set a mark to remember the formatting and clear it
+		# at the end of a user action, or with the next insert at a different
+		# location
+		if self._deleted_editmode_mark:
+			self.delete_mark(self._deleted_editmode_mark)
+		self._deleted_editmode_mark = self.create_mark(None, end, left_gravity=True)
+		self._deleted_editmode_mark.editmode_tags = self.iter_get_zim_tags(end)
+
+	def do_post_delete_range(self, start, end):
+		# Post handler to hook _do_lines_merged and do some logic
+		# when deleting bullets
 		# Note that 'start' and 'end' refer to the same postion here ...
 
 		if (
@@ -2142,10 +2248,11 @@ class TextBuffer(Gtk.TextBuffer):
 				# handled by _do_lines_merged by extending the indent tag)
 				self.update_indent_tag(start.get_line(), None)
 
-		self._check_edit_mode = True
+		self.update_editmode()
 
 	def _do_lines_merged(self, iter):
 		# Enforce tags like 'h', 'pre' and 'indent' to be consistent over the line
+		# Merge links that have same href target
 		if iter.starts_line() or iter.ends_line():
 			return # TODO Why is this ???
 
@@ -2159,6 +2266,13 @@ class TextBuffer(Gtk.TextBuffer):
 				if tag.zim_tag == 'pre':
 					self.smart_remove_tags(_is_zim_tag, iter, end)
 				self.apply_tag(tag, iter, end)
+			elif _is_link_tag(tag):
+				for rh_tag in filter(_is_link_tag, iter.get_tags()):
+					if rh_tag is not tag and rh_tag.zim_attrib['href'] == tag.zim_attrib['href']:
+						bound = iter.copy()
+						bound.forward_to_tag_toggle(rh_tag)
+						self.remove_tag(rh_tag, iter, bound)
+						self.apply_tag(tag, iter, bound)
 
 		self.update_editmode()
 
@@ -2292,13 +2406,28 @@ class TextBuffer(Gtk.TextBuffer):
 			# It does so be keeping the stack of open tags and compare it
 			# with the new set of tags in order to decide which of the
 			# tags can be closed and which new ones need to be opened.
-			#
-			# We assume that by definition we only get one tag for each tag
-			# type and that we get tags in such an order that the one we get
-			# first should be closed first while closing later ones breaks the
-			# ones before. This is enforced using the priorities of the tags
-			# in the TagTable.
-			tags.sort(key=lambda tag: tag.get_priority(), reverse=True)
+
+			tags.sort(key=lambda tag: tag.get_priority())
+			if any(_is_tag_tag(t) for t in tags):
+				# Although not highest prio, no other tag can nest below a tag-tag
+				while not _is_tag_tag(tags[-1]):
+					tags.pop()
+
+			if any(_is_inline_nesting_tag(t) for t in tags):
+				tags = self._sort_nesting_style_tags(iter, end, tags, [t[0] for t in open_tags])
+
+			# For tags that can only appear once, if somehow an overlap
+			# occured, choose the one with the highest prio
+			for i in range(len(tags)-2, -1, -1):
+				if tags[i].zim_type in ('link', 'tag', 'indent') \
+					and tags[i+1].zim_type == tags[i].zim_type:
+						tags.pop(i)
+				elif tags[i+1].zim_tag == 'h' \
+					and tags[i].zim_tag in ('h', 'indent'):
+						tags.pop(i)
+				elif tags[i+1].zim_tag == 'pre' \
+					and tags[i].zim_type == 'style':
+						tags.pop(i)
 
 			i = 0
 			while i < len(tags) and i < len(open_tags) \
@@ -2343,9 +2472,7 @@ class TextBuffer(Gtk.TextBuffer):
 							attrib = continue_attrib
 						continue_attrib = {}
 					elif t == 'link':
-						attrib = self.get_link_data(iter)
-						if not attrib['href']:
-							t = '_ignore_'
+						attrib = self.get_link_data(iter, raw=raw)
 					elif t == 'tag':
 						attrib = self.get_tag_data(iter)
 						if not attrib['name']:
@@ -2498,6 +2625,42 @@ class TextBuffer(Gtk.TextBuffer):
 			#print(">>> Parsetree recreated:\n", tree.tostring())
 
 		return tree
+
+	def _sort_nesting_style_tags(self, iter, end, tags, open_tags):
+		new_block, new_nesting, new_leaf = self._split_nesting_style_tags(tags)
+		open_block, open_nesting, open_leaf = self._split_nesting_style_tags(open_tags)
+		sorted_new_nesting = []
+
+		# First prioritize open tags - these are sorted already
+		if new_block == open_block:
+			for tag in open_nesting:
+				if tag in new_nesting:
+					i = new_nesting.index(tag)
+					sorted_new_nesting.append(new_nesting.pop(i))
+				else:
+					break
+
+		# Then sort by length untill closing all tags that open at the same time
+		def tag_close_pos(tag):
+			my_iter = iter.copy()
+			my_iter.forward_to_tag_toggle(tag)
+			if my_iter.compare(end) > 0:
+				return end.get_offset()
+			else:
+				return my_iter.get_offset()
+
+		new_nesting.sort(key=tag_close_pos, reverse=True)
+		sorted_new_nesting += new_nesting
+
+		return new_block + sorted_new_nesting + new_leaf
+
+	def _split_nesting_style_tags(self, tags):
+		block, nesting = [], []
+		while tags and not _is_inline_nesting_tag(tags[0]):
+			block.append(tags.pop(0))
+		while tags and _is_inline_nesting_tag(tags[0]):
+			nesting.append(tags.pop(0))
+		return block, nesting, tags
 
 	def select_line(self, line=None):
 		'''Selects a line
@@ -3452,18 +3615,15 @@ class TextFinder(object):
 		matches.reverse() # work our way back top keep offsets valid
 
 		with self.buffer.user_action:
-			with self.buffer.tmp_cursor():
-				for startoff, endoff, string in matches:
+			for startoff, endoff, string in matches:
+				start = self.buffer.get_iter_at_offset(startoff)
+				end = self.buffer.get_iter_at_offset(endoff)
+				if start.get_child_anchor() is not None:
+					self._replace_in_widget(start, self.regex, string, True)
+				else:
+					self.buffer.delete(start, end)
 					start = self.buffer.get_iter_at_offset(startoff)
-					end = self.buffer.get_iter_at_offset(endoff)
-					if start.get_child_anchor() is not None:
-						self._replace_in_widget(start, self.regex, string, True)
-					else:
-						self.buffer.select_range(start, end) # ensure editmode logic is used
-						self.buffer.delete(start, end)
-
-						start = self.buffer.get_iter_at_offset(startoff)
-						self.buffer.insert(start, string)
+					self.buffer.insert(start, string)
 
 		self._update_highlight()
 
@@ -4192,80 +4352,99 @@ class TextView(Gtk.TextView):
 	def do_end_of_word(self, start, end, word, char, editmode):
 		# Default handler with built-in auto-formatting options
 		buffer = self.get_buffer()
-		handled = True
+		handled = False
 		#~ print('WORD >>%s<< CHAR >>%s<<' % (word, char))
-
-		if list(filter(_is_not_indent_tag, buffer.iter_get_zim_tags(start))) \
-		or list(filter(_is_not_indent_tag, buffer.iter_get_zim_tags(end))):
-			# DO not auto-format if any zim tags are applied except for indent
-			return
 
 		def apply_tag(match):
 			#~ print("TAG >>%s<<" % word)
 			start = end.copy()
 			if not start.backward_chars(len(match)):
 				return False
-			if buffer.range_has_tags(_is_not_indent_tag, start, end):
+			elif buffer.range_has_tags(_is_non_nesting_tag, start, end):
 				return False
-			tag = buffer._create_tag_tag(match)
-			buffer.apply_tag(tag, start, end)
-			return True
+			else:
+				tag = buffer._create_tag_tag(match)
+				buffer.apply_tag(tag, start, end)
+				return True
 
-		def apply_link(match):
+		def apply_link(match, offset_end=0):
 			#~ print("LINK >>%s<<" % word)
-			start = end.copy()
+			myend = end.copy()
+			myend.backward_chars(offset_end)
+			start = myend.copy()
 			if not start.backward_chars(len(match)):
 				return False
-			if buffer.range_has_tags(_is_not_indent_tag, start, end):
-				return False
-			tag = buffer._create_link_tag(match, match)
-			buffer.apply_tag(tag, start, end)
-			return True
+			elif buffer.range_has_tags(_is_non_nesting_tag, start, myend) \
+				or buffer.range_has_tags(_is_link_tag, start, myend):
+					return False # No link inside a link
+			else:
+				tag = buffer._create_link_tag(match, match)
+				buffer.apply_tag(tag, start, myend)
+				return True
 
-		if (char == ' ' or char == '\t') and start.starts_line() \
+		def allow_bullet(iter):
+			if iter.starts_line():
+				return True
+			elif iter.get_line_offset() < 10:
+				home = buffer.get_iter_at_line(iter.get_line())
+				return buffer.iter_forward_past_bullet(home) and start.equal(iter)
+			else:
+				return False
+
+		if (char == ' ' or char == '\t') and allow_bullet(start) \
 		and (word in autoformat_bullets or is_numbered_bullet_re.match(word)):
-			# format bullet and checkboxes
-			line = start.get_line()
-			end.forward_char() # also overwrite the space triggering the action
-			buffer.delete(start, end)
-			bullet = autoformat_bullets.get(word) or word
-			buffer.set_bullet(line, bullet)
+			if buffer.range_has_tags(_is_heading_tag, start, end):
+				handled = False # No bullets in headings
+			else:
+				# format bullet and checkboxes
+				line = start.get_line()
+				end.forward_char() # also overwrite the space triggering the action
+				buffer.delete(start, end)
+				bullet = autoformat_bullets.get(word) or word
+				buffer.set_bullet(line, bullet) # takes care of replacing bullets as well
+				handled = True
 		elif tag_re.match(word):
-			apply_tag(tag_re[0])
-		elif url_re.match(word):
-			apply_link(url_re[0])
+			handled = apply_tag(tag_re[0])
+		elif url_re.search(word):
+			if char == ')':
+				handled = False # to early to call
+			else:
+				m = url_re.search(word)
+				url = match_url(m.group(0))
+				tail = word[m.start()+len(url):]
+				handled = apply_link(url, offset_end=len(tail))
 		elif page_re.match(word):
 			# Do not link "10:20h", "10:20PM" etc. so check two letters before first ":"
 			w = word.strip(':').split(':')
 			if w and twoletter_re.search(w[0]):
-				apply_link(page_re[0])
+				handled = apply_link(page_re[0])
 			else:
 				handled = False
 		elif interwiki_re.match(word):
-			apply_link(interwiki_re[0])
+			handled = apply_link(interwiki_re[0])
 		elif self.preferences['autolink_files'] and file_re.match(word):
-			apply_link(file_re[0])
+			handled = apply_link(file_re[0])
 		elif self.preferences['autolink_camelcase'] and camelcase(word):
-			apply_link(word)
+			handled = apply_link(word)
 		elif self.preferences['auto_reformat']:
-			handled = False
 			linestart = buffer.get_iter_at_line(end.get_line())
 			partial_line = linestart.get_slice(end)
-			for style, re in list(markup_re.items()):
-				if not re.search(partial_line) is None:
+			for style, style_re in markup_re:
+				m = style_re.search(partial_line)
+				if m:
 					matchstart = linestart.copy()
-					matchstart.forward_chars(re.start())
+					matchstart.forward_chars(m.start())
 					matchend = linestart.copy()
-					matchend.forward_chars(re.end())
-					if list(filter(_is_not_indent_tag, buffer.iter_get_zim_tags(matchstart))) \
-					or list(filter(_is_not_indent_tag, buffer.iter_get_zim_tags(matchend))):
-						continue
-					buffer.delete(matchstart, matchend)
-					buffer.insert_with_tags_by_name(matchstart, re[2], style)
-					handled_here = True
-					break
-		else:
-			handled = False
+					matchend.forward_chars(m.end())
+					if buffer.range_has_tags(_is_non_nesting_tag, matchstart, matchend) \
+						or buffer.range_has_tags(_is_link_tag_without_href, matchstart, matchend):
+							break
+					else:
+						with buffer.tmp_cursor(matchstart):
+							buffer.delete(matchstart, matchend)
+							buffer.insert_with_tags_by_name(matchstart, m.group(1), style)
+							handled = True
+							break
 
 		if handled:
 			self.stop_emission('end-of-word')
@@ -5111,7 +5290,7 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 
 	@signal: C{modified-changed ()}: emitted when the page is edited
 	@signal: C{textstyle-changed (style)}:
-	Emitted when textstyle at the cursor changes
+	Emitted when textstyle at the cursor changes, gets the list of text styles or None.
 	@signal: C{activate-link (link, hints)}: emitted when a link is opened,
 	stops emission after the first handler returns C{True}
 	@signal: C{ui-init ()}: trigger for extensions to load uimanager stuff,
@@ -5122,7 +5301,7 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 	@todo: document style properties supported by this widget
 
 	@todo: refactor such that the PageView doesn't need to know whether
-	it is in a secondairy window or not
+	it is in a secondary window or not
 	'''
 
 	# define signals we want to use - (closure type, return type and arg types)
@@ -5364,7 +5543,14 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 		def set_actiongroup_sensitive(window, widget):
 			#~ print('!! FOCUS SET:', widget)
 			sensitive = widget is self.textview
-			self._set_menuitems_sensitive(sensitive)
+
+			# Enable keybindings and buttons for find functionality if find bar is in focus
+			force_sensitive = ()
+			if widget and widget.get_parent() is self.find_bar:
+				force_sensitive = ("show_find", "find_next", "find_previous",
+					"show_find_alt1", "find_next_alt1", "find_previous_alt1")
+
+			self._set_menuitems_sensitive(sensitive, force_sensitive)
 
 		window = self.get_toplevel()
 		if window and window != self:
@@ -5617,10 +5803,11 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 			self.preferences['read_only_cursor'] or not self.readonly)
 		self._set_menuitems_sensitive(True) # XXX not sure why this is here
 
-	def _set_menuitems_sensitive(self, sensitive):
+	def _set_menuitems_sensitive(self, sensitive, force_sensitive=()):
 		'''Batch update global menu sensitivity while respecting
 		sensitivities set due to cursor position, readonly state etc.
 		'''
+
 		if sensitive:
 			# partly overrule logic in window.toggle_editable()
 			for action in self.actiongroup.list_actions():
@@ -5634,7 +5821,10 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 			self.do_mark_set(buffer, iter, mark)
 		else:
 			for action in self.actiongroup.list_actions():
-				action.set_sensitive(False)
+				if action.get_name() not in force_sensitive:
+					action.set_sensitive(False)
+				else:
+					action.set_sensitive(True)
 
 	def set_cursor_pos(self, pos):
 		'''Set the cursor position in the buffer and scroll the TextView
@@ -5758,15 +5948,12 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 			self.actiongroup.get_action('edit_object').set_sensitive(False)
 			self.actiongroup.get_action('remove_link').set_sensitive(False)
 
-	def do_textstyle_changed(self, style):
+	def do_textstyle_changed(self, styles):
 		# Update menu items for current style
 		#~ print('>>> SET STYLE', style)
 
-		# set toolbar toggles
-		if style:
-			style_toggle = 'toggle_format_' + style
-		else:
-			style_toggle = None
+		if not styles:  # styles can be None or a list
+			styles = []
 
 		# Here we explicitly never change the toggle that initiated
 		# the change (_current_toggle_action). Somehow touching this
@@ -5783,7 +5970,7 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 				continue
 			else:
 				action.handler_block_by_func(self.do_toggle_format_action)
-				action.set_active(name == style_toggle)
+				action.set_active(name[len("toggle_format_"):] in styles)
 				action.handler_unblock_by_func(self.do_toggle_format_action)
 
 		#~ print('<<<')
@@ -6236,6 +6423,13 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 		'''
 		InsertImageDialog(self, self.textview.get_buffer(), self.notebook, self.page, file).run()
 
+	@action(_('_Attachment...'), verb_icon='zim-attachment', menuhints='insert') # T: Menu item
+	def attach_file(self, file=None):
+		'''Menu action to show the L{AttachFileDialog}
+		@param file: optional file to suggest in the dialog
+		'''
+		AttachFileDialog(self, self.textview.get_buffer(), self.notebook, self.page, file).run()
+
 	def insert_image(self, file):
 		'''Insert a image
 		@param file: the image file to insert. If C{file} does not exist or
@@ -6453,7 +6647,7 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 				buffer.unset_selection()
 				buffer.place_cursor(buffer.get_iter_at_mark(mark))
 		else:
-			buffer.set_textstyle(None)
+			buffer.set_textstyles(None)
 
 		buffer.delete_mark(mark)
 
@@ -6475,12 +6669,9 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 		'''Toggle the format for the current (auto-)selection or new
 		insertions at the current cursor position
 
-		When the cursor is in the middle of a word it can be selected
-		automatically to format it. But we only autoselect words that
-		were not formatted - otherwise the behavior is not consistent
-		when trying to break a formatted region by toggling off the
-		formatting. For headings and other line based formats
-		auto-selects the whole line.
+		When the cursor is at the begin or in the middle of a word and there is
+		not selection, the word is selected automatically to toggle the format.
+		For headings and other line based formats auto-selects the whole line.
 
 		This is the handler for all the format menu- and toolbar-items.
 
@@ -6490,9 +6681,15 @@ class PageView(GSignalEmitterMixin, Gtk.VBox):
 		selected = False
 		mark = buffer.create_mark(None, buffer.get_insert_iter())
 
-		if format != buffer.get_textstyle():
-			ishead = format in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')
-			selected = self.autoselect(selectline=ishead)
+		if format in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+			selected = self.autoselect(selectline=True)
+		else:
+			# Check formatting is consistent left and right
+			iter = buffer.get_insert_iter()
+			format_left = format in [t.zim_tag for t in buffer.iter_get_zim_tags(iter)]
+			format_right = format in [t.zim_tag for t in filter(_is_zim_tag, iter.get_tags())]
+			if format_left is format_right:
+				selected = self.autoselect(selectline=False)
 
 		buffer.toggle_textstyle(format)
 
@@ -6705,7 +6902,8 @@ class InsertDateDialog(Dialog):
 			self,
 			parent,
 			_('Insert Date and Time'), # T: Dialog title
-			button=_('_Insert') # T: Button label
+			button=_('_Insert'), # T: Button label
+			use_default_button=True
 		)
 		self.buffer = buffer
 		self.notebook = notebook
@@ -6714,7 +6912,22 @@ class InsertDateDialog(Dialog):
 
 		self.uistate.setdefault('lastusedformat', '')
 		self.uistate.setdefault('linkdate', False)
-		self.uistate.setdefault('calendar_expanded', False)
+
+		## Add Calendar widget
+		from zim.plugins.journal import Calendar # FIXME put this in zim.gui.widgets
+
+		label = Gtk.Label()
+		label.set_markup('<b>' + _("Date") + '</b>') # T: label in "insert date" dialog
+		label.set_alignment(0.0, 0.5)
+		self.vbox.pack_start(label, False, False, 0)
+
+		self.calendar = Calendar()
+		self.calendar.set_display_options(
+			Gtk.CalendarDisplayOptions.SHOW_HEADING |
+			Gtk.CalendarDisplayOptions.SHOW_DAY_NAMES |
+			Gtk.CalendarDisplayOptions.SHOW_WEEK_NUMBERS)
+		self.calendar.connect('day-selected', lambda c: self.set_date(c.get_date()))
+		self.vbox.pack_start(self.calendar, False, True, 0)
 
 		## Add format list box
 		label = Gtk.Label()
@@ -6732,22 +6945,6 @@ class InsertDateDialog(Dialog):
 		self.view.set_headers_visible(False)
 		self.view.connect('row-activated',
 			lambda *a: self.response(Gtk.ResponseType.OK))
-
-		## Add Calendar widget
-		from zim.plugins.journal import Calendar # FIXME put this in zim.gui.widgets
-
-		self.calendar_expander = Gtk.Expander.new_with_mnemonic('<b>' + _("_Calendar") + '</b>')
-			# T: expander label in "insert date" dialog
-		self.calendar_expander.set_use_markup(True)
-		self.calendar_expander.set_expanded(self.uistate['calendar_expanded'])
-		self.calendar = Calendar()
-		self.calendar.set_display_options(
-			Gtk.CalendarDisplayOptions.SHOW_HEADING |
-			Gtk.CalendarDisplayOptions.SHOW_DAY_NAMES |
-			Gtk.CalendarDisplayOptions.SHOW_WEEK_NUMBERS)
-		self.calendar.connect('day-selected', lambda c: self.set_date(c.get_date()))
-		self.calendar_expander.add(self.calendar)
-		self.vbox.pack_start(self.calendar_expander, False, True, 0)
 
 		## Add Link checkbox and Edit button
 		self.linkbutton = Gtk.CheckButton.new_with_mnemonic(_('_Link to date'))
@@ -6817,7 +7014,6 @@ class InsertDateDialog(Dialog):
 			format = model[iter][self.FORMAT_COL]
 			self.uistate['lastusedformat'] = format
 		self.uistate['linkdate'] = self.linkbutton.get_active()
-		self.uistate['calendar_expanded'] = self.calendar_expander.get_expanded()
 
 	def on_edit(self, button):
 		file = ConfigManager.get_config_file('dates.list') # XXX
@@ -6896,15 +7092,12 @@ class InsertImageDialog(FileDialog):
 
 class AttachFileDialog(FileDialog):
 
-	def __init__(self, parent, notebook, path, pageview=None):
+	def __init__(self, parent, buffer, notebook, path, file=None):
 		assert path, 'Need a page here'
 		FileDialog.__init__(self, parent, _('Attach File'), multiple=True) # T: Dialog title
+		self.buffer = buffer
 		self.notebook = notebook
 		self.path = path
-		self.pageview = pageview
-
-		self.add_shortcut(notebook, path)
-		self.load_last_folder()
 
 		dir = notebook.get_attachments_dir(path)
 		if dir is None:
@@ -6912,11 +7105,11 @@ class AttachFileDialog(FileDialog):
 				# T: Error dialog - %s is the full page name
 			raise Exception('Page "%s" does not have a folder for attachments' % self.path)
 
-		self.uistate.setdefault('insert_attached_images', True)
-		checkbox = Gtk.CheckButton.new_with_mnemonic(_('Insert images as link'))
-			# T: checkbox in the "Attach File" dialog
-		checkbox.set_active(not self.uistate['insert_attached_images'])
-		self.filechooser.set_extra_widget(checkbox)
+		self.add_shortcut(notebook, path)
+		if file:
+			self.set_file(file)
+		else:
+			self.load_last_folder()
 
 	def do_response_ok(self):
 		files = self.get_files()
@@ -6925,9 +7118,110 @@ class AttachFileDialog(FileDialog):
 
 		self.save_last_folder()
 
-		# Similar code in zim.gui.pageview.InsertImageDialog
-		checkbox = self.filechooser.get_extra_widget()
-		self.uistate['insert_attached_images'] = not checkbox.get_active()
+		inserted = False
+		last = len(files) - 1
+		for i, file in enumerate(files):
+			file = attach_file(self, self.notebook, self.path, file)
+			if file is not None:
+				inserted = True
+				text = self.notebook.relative_filepath(file, path=self.path)
+				self.buffer.insert_link_at_cursor(text, href=text)
+				if i != last:
+					self.buffer.insert_at_cursor(' ')
+
+		return inserted # If nothing is inserted, return False and do not close dialog
+
+
+def attach_file(widget, notebook, path, file, force_overwrite=False):
+	folder = notebook.get_attachments_dir(path)
+	if folder is None:
+		raise Error('%s does not have an attachments dir' % path)
+
+	dest = folder.file(file.basename)
+	if dest.exists() and not force_overwrite:
+		dialog = PromptExistingFileDialog(widget, dest)
+		dest = dialog.run()
+		if dest is None:
+			return None	# dialog was cancelled
+		elif dest.exists():
+			dest.remove()
+
+	file.copyto(dest)
+	return dest
+
+
+class PromptExistingFileDialog(Dialog):
+	'''Dialog that is used e.g. when a file should be attached to zim,
+	but a file with the same name already exists in the attachment
+	directory. This Dialog allows to suggest a new name or overwrite
+	the existing one.
+
+	For this dialog C{run()} will return either the original file
+	(for overwrite), a new file, or None when the dialog was canceled.
+	'''
+
+	def __init__(self, widget, file):
+		Dialog.__init__(self, widget, _('File Exists'), buttons=None) # T: Dialog title
+		self.add_help_text( _('''\
+A file with the name <b>"%s"</b> already exists.
+You can use another name or overwrite the existing file.''' % file.basename),
+		) # T: Dialog text in 'new filename' dialog
+		self.folder = file.parent()
+		self.old_file = file
+
+		suggested_filename = self.folder.new_file(file.basename).basename
+		self.add_form((
+				('name', 'string', _('Filename')), # T: Input label
+			), {
+				'name': suggested_filename
+			}
+		)
+		self.form.widgets['name'].set_check_func(self._check_valid)
+
+		# all buttons are defined in this class, to get the ordering right
+		# [show folder]      [overwrite] [cancel] [ok]
+		button = Gtk.Button.new_with_mnemonic(_('_Browse')) # T: Button label
+		button.connect('clicked', self.do_show_folder)
+		self.action_area.add(button)
+		self.action_area.set_child_secondary(button, True)
+
+		button = Gtk.Button.new_with_mnemonic(_('Overwrite')) # T: Button label
+		button.connect('clicked', self.do_response_overwrite)
+		self.add_action_widget(button, Gtk.ResponseType.NONE)
+
+		self.add_button(_('_Cancel'), Gtk.ResponseType.CANCEL) # T: Button label
+		self.add_button(_('_OK'), Gtk.ResponseType.OK) # T: Button label
+		self._no_ok_action = False
+
+		self.form.widgets['name'].connect('focus-in-event', self._on_focus)
+
+	def _on_focus(self, widget, event):
+		# filename length without suffix
+		length = len(os.path.splitext(widget.get_text())[0])
+		widget.select_region(0, length)
+
+	def _check_valid(self, filename):
+		# Only valid when same dir and does not yet exist
+		file = self.folder.file(filename)
+		return file.ischild(self.folder) and not file.exists()
+
+	def do_show_folder(self, *a):
+		open_folder(self, self.folder)
+
+	def do_response_overwrite(self, *a):
+		logger.info('Overwriting %s', self.old_file.path)
+		self.result = self.old_file
+
+	def do_response_ok(self):
+		if not self.form.widgets['name'].get_input_valid():
+			return False
+
+		newfile = self.folder.file(self.form['name'])
+		logger.info('Selected %s', newfile.path)
+		assert newfile.ischild(self.folder) # just to be real sure
+		assert not newfile.exists() # just to be real sure
+		self.result = newfile
+		return True
 
 
 class EditImageDialog(Dialog):
@@ -7015,7 +7309,7 @@ class EditImageDialog(Dialog):
 			self._ratio = float(w) / h
 
 	def do_width_changed(self):
-		if self._block:
+		if hasattr(self, '_block') and self._block:
 			return
 		self._image_data.pop('height', None)
 		self._image_data['width'] = int(self.form['width'])
@@ -7025,7 +7319,7 @@ class EditImageDialog(Dialog):
 		self._block = False
 
 	def do_height_changed(self):
-		if self._block:
+		if hasattr(self, '_block') and self._block:
 			return
 		self._image_data.pop('width', None)
 		self._image_data['height'] = int(self.form['height'])
@@ -7298,13 +7592,11 @@ class FindWidget(object):
 		buffer = self.textview.get_buffer()
 		buffer.finder.find_next()
 		self.textview.scroll_to_mark(buffer.get_insert(), SCROLL_TO_MARK_MARGIN, False, 0, 0)
-		self.textview.grab_focus()
 
 	def find_previous(self):
 		buffer = self.textview.get_buffer()
 		buffer.finder.find_previous()
 		self.textview.scroll_to_mark(buffer.get_insert(), SCROLL_TO_MARK_MARGIN, False, 0, 0)
-		self.textview.grab_focus()
 
 
 class FindBar(FindWidget, Gtk.HBox):
@@ -7347,7 +7639,7 @@ class FindBar(FindWidget, Gtk.HBox):
 
 	def on_find_entry_activate(self):
 		self.on_find_entry_changed()
-		self.textview.grab_focus()
+		self.find_next()
 
 	def do_key_press_event(self, event):
 		keyval = strip_boolean_result(event.get_keyval())

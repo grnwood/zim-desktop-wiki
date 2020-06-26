@@ -5,6 +5,45 @@ Jaap Karssenberg <jaap.karssenberg@gmail.com>
 This branch is the Python rewrite and starts with version 0.42.
 Earlier version numbers for zim correspond to the Perl branch.
 
+##  0.73.1 - Fri 19 Jun 2020
+* Fix regression for opening single instance
+* Fix exception on toggle format
+* Fix failing tests due to change in sorting python3.8
+* Make robust for deprecation of cElementTree in python3.9
+* Improve tmpdir usage by using tempfile.mkdtemp()
+
+##  0.73.0 - Sat 06 Jun 2020
+* Add ability to combine formatting styles in editor
+* Improve URL and link parsing to look for matching brackets
+* Reduce the number of `-` needed to auto-format a horizontal line
+* Allow typing bullet after e.g. checkbox to replace it
+* Add autoformat for sub- and super-script by typing `^..` and `_{..}`
+* On autoformat headings also strip trailing `=`
+* Fix issue with lost formatting when using spellchecker
+* Add support for "paragraph-background" property in style.conf
+* Improve keyboard behavior of find bar in editor
+* Swap the layout in the InsertDateDialog
+* Allow re-arranging side pane tabs by drag and drop
+* Add option to automatically collapse sections in the pageindex
+* Fix regression for inserting links on "Attach file" and moved this
+  function to the Insert menu
+* Merge MovePageDialog and RenamePageDialog into a single dialog
+* Fix behavior when renaming non-existing "placeholder" pages
+* Add workaround for drag-and-drop issue #390
+* Whitelist image formats in latex export to avoid invalid image types
+* Add MacOS menubar plugin & fix for main menu mnemonics in MacOS
+* Give temporary directories unique names to improve robustness
+* Support TEXTDOMAINDIR evironment variable to set locale directory
+* Improve folder checks for automount feature
+* Improve window colors in distraction free mode
+* Add option to set the wrap-mode in sourceview
+* Add theme choice for the source view plugin
+* Add "private" switch to server command for commandline usage
+* Add authentication support to web server
+* Add template selection option to web server dialog
+* Add option for fontsize to table of contents plugin
+* Add option to show horizontal lines in table of contents
+
 ##  0.72.1 - Wed 01 Jan 2020
 * Update translations & documentation
 
@@ -336,7 +375,7 @@ intelligent - Virgil Dupras
 * Made image data pasted as bmp convert to png to make it more compact
 * Critical bug fix for version control plugin
 * Critical bug fix for xml.etree.TreeBuilder API for python 2.7.3
-* Bug fix for exceptions in index - Fabian Moser
+* Bug fix for exceptions in index - Fabian Stanke
 * Bug fix for interwiki links
 * On windows fix for bug when home folder or user name contain non-ascii characters
 * Fixed help manual opens in compiled windows version
@@ -462,7 +501,7 @@ Bug fix release
   added preference to revert to old behavior
 * Disable <Alt><Space> keybinding due to conflicts with internationalization
   added hidden preference to get it back if desired
-* Added support for organizing pages by tags - Fabian Moser
+* Added support for organizing pages by tags - Fabian Stanke
 * Added feature to zoom font size of the page view on <Ctrl>+ / <Ctrl>-
   - Konstantin Baierer
 * Added support for system Trash (using gio if available)
@@ -524,7 +563,7 @@ of input forms and dialogs, but this is not very visible to the user.
 * Patch backporting per-user site-packages dir for python 2.5 - by Jiří Janoušek
 * Fix for bug with spaces in links in exported HTML - by Jiří Janoušek
 * Fixed bug forcing empty lines after an indented section
-* Patch for indenting in verbatim paragraphs - by Fabian Moser
+* Patch for indenting in verbatim paragraphs - by Fabian Stanke
 * Fixed bug with unicode handling for file paths
 * Added names for pageindex and pageview widgets for use in gtkrc
 * Patch to jump to task within page - by Thomas Liebertraut
@@ -583,7 +622,7 @@ Big release with lots of new functionality but also many bug fixes
 * Fixed bug with non-utf8 unicode in urls
 * Fixed bugs with calendar plugin when embedded in side pane
 * Fixed support for icons for custom tools
-* Fixed bug with indented verbatim blocks (Fabian Moser)
+* Fixed bug with indented verbatim blocks (Fabian Stanke)
 * Added translation for Traditional Chinese
 
 ##  0.46 - Wed 24 Mar 2010

@@ -6,8 +6,6 @@ part from the main Gtk interface. It defines a Gtk interface that can be
 used to start/stop the WWW server.
 '''
 
-# TODO: allow setting a password for public access to private server..
-
 # TODO: expander or button to open the server log
 
 # TODO: have url button show public hostname
@@ -23,10 +21,11 @@ import sys
 import logging
 
 from zim.www import make_server
+from zim.templates import list_templates
 
 from zim.notebook import build_notebook, NotebookInfo
 from zim.config import data_file
-from zim.gui.widgets import IconButton, ErrorDialog, input_table_factory
+from zim.gui.widgets import IconButton, ErrorDialog, InputEntry, input_table_factory
 from zim.gui.notebookdialog import NotebookComboBox, NotebookDialog
 
 
@@ -77,6 +76,17 @@ class ServerWindow(Gtk.Window):
 			# T: Checkbox in web server gui
 		self.public_checkbox.set_active(public)
 
+		self.templatecombobox = Gtk.ComboBoxText.new()
+		template_names = [name for name, _ in list_templates('html')]
+		for name in template_names:
+		    self.templatecombobox.append_text(name)
+		self.templatecombobox.set_active(template_names.index('Default'))
+
+		self.auth_checkbox = Gtk.CheckButton.new_with_mnemonic(_('Require authentication'))
+			# T: checkbox in dialog for starting webserver
+		self.username_input = InputEntry()
+		self.password_input = InputEntry()
+		self.password_input.set_visibility(False)
 
 		# Build the interface
 		vbox = Gtk.VBox()
@@ -93,7 +103,14 @@ class ServerWindow(Gtk.Window):
 				# T: Field in web server gui
 			(_('Port'), self.portentry),
 				# T: Field in web server gui for HTTP port (e.g. port 80)
-			self.public_checkbox
+            (_('Template'), self.templatecombobox),
+				# T: Field in web server gui for webpage template
+			self.public_checkbox,
+			self.auth_checkbox,
+			(_('Username'), self.username_input),
+				# T: Field in web server gui
+			(_('Password'), self.password_input)
+				# T: Field in web server gui
 		))
 		vbox.pack_start(table, False, False, 0)
 
@@ -128,7 +145,15 @@ class ServerWindow(Gtk.Window):
 
 			port = int(self.portentry.get_value())
 			public = self.public_checkbox.get_active()
-			self.httpd = make_server(notebook, port, public, **self.interface_opts)
+			self.interface_opts['template'] = self.templatecombobox.get_active_text()
+
+			require_auth = self.auth_checkbox.get_active()
+			auth_creds = None
+			if require_auth:
+				auth_creds = (self.username_input.get_text(), self.password_input.get_text())
+			self.httpd = make_server(notebook, port, public,
+				auth_creds=auth_creds, **self.interface_opts)
+
 			if sys.platform == 'win32':
 				# GObject io watch conflicts with socket use on windows..
 				# idle handler uses a bit to much CPU for my taste,
@@ -151,9 +176,13 @@ class ServerWindow(Gtk.Window):
 		self.notebookcombobox.set_sensitive(False)
 		self.portentry.set_sensitive(False)
 		self.public_checkbox.set_sensitive(False)
+		self.templatecombobox.set_sensitive(False)
 		self.open_button.set_sensitive(False)
 		self.start_button.set_sensitive(False)
 		self.stop_button.set_sensitive(True)
+		self.auth_checkbox.set_sensitive(False)
+		self.username_input.set_sensitive(False)
+		self.password_input.set_sensitive(False)
 
 		self.status_label.set_markup('<i>' + _('Server started') + '</i>')
 			# T: Status in web server gui
@@ -203,9 +232,13 @@ class ServerWindow(Gtk.Window):
 		self.notebookcombobox.set_sensitive(True)
 		self.portentry.set_sensitive(True)
 		self.public_checkbox.set_sensitive(True)
+		self.templatecombobox.set_sensitive(True)
 		self.open_button.set_sensitive(True)
 		self.stop_button.set_sensitive(False)
 		self.start_button.set_sensitive(True)
+		self.auth_checkbox.set_sensitive(True)
+		self.username_input.set_sensitive(True)
+		self.password_input.set_sensitive(True)
 
 
 def main(notebookinfo=None, port=8080, public=True, **opts):

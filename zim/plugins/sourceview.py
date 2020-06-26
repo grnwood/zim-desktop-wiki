@@ -5,7 +5,7 @@
 
 import logging
 
-logger = logging.getLogger('zim.pugin.sourceview')
+logger = logging.getLogger('zim.plugins.sourceview')
 
 
 # This plugin can work without GUI for just the export
@@ -23,16 +23,14 @@ try:
 except:
 	GtkSource = None
 
-from zim.plugins import PluginClass, InsertedObjectTypeExtension
+from zim.plugins import PluginClass, InsertedObjectTypeExtension, PLUGIN_FOLDER
 from zim.actions import action
 from zim.utils import WeakSet
 from zim.config import String, Boolean
 from zim.formats.html import html_encode
 
-from zim.gui.pageview import PageViewExtension
 from zim.gui.widgets import Dialog, ScrolledWindow
-from zim.gui.insertedobjects import InsertedObjectWidget, TextViewWidget
-
+from zim.gui.insertedobjects import TextViewWidget
 
 if GtkSource:
 	lm = GtkSource.LanguageManager()
@@ -40,9 +38,23 @@ if GtkSource:
 	lang_names = [lm.get_language(i).get_name() for i in lang_ids]
 
 	LANGUAGES = dict((lm.get_language(i).get_name(), i) for i in lang_ids)
+
+	ssm = GtkSource.StyleSchemeManager()
+
+	# add an optional path in PLUGIN_FOLDER  where the user can set his
+	# custom styles
+	plugin_name = __name__.split('.')[-1]
+	ssm.append_search_path(PLUGIN_FOLDER.subdir(plugin_name).path)
+	# ~ print(ssm.get_search_path())
+
+	STYLES = ssm.get_scheme_ids()
+	if not STYLES:
+		logger.exception('Themes for the SourceView Plugin, normally in %s are not found', str(ssm.get_search_path()))
 else:
 	LANGUAGES = {}
 #~ print LANGUAGES
+	STYLES = []
+# ~ print (STYLES)
 
 
 class SourceViewPlugin(PluginClass):
@@ -57,6 +69,12 @@ shown as embedded widgets with syntax highlighting, line numbers etc.
 		'help': 'Plugins:Source View',
 	}
 
+	global WRAP_NONE, WRAP_WORD_CHAR, WRAP_CHAR, WRAP_WORD # Hack - to make sure translation is loaded
+	WRAP_NONE = _('Never wrap lines') # T: option value
+	WRAP_WORD_CHAR = _('Try wrap at word boundaries or character') # T: option value
+	WRAP_CHAR = _('Always wrap at character') # T: option value
+	WRAP_WORD = _('Always wrap at word boundaries') # T: option value
+
 	plugin_preferences = (
 		# key, type, label, default
 		('auto_indent', 'bool', _('Auto indenting'), True),
@@ -70,6 +88,11 @@ shown as embedded widgets with syntax highlighting, line numbers etc.
 		('right_margin_position', 'int', _('Right margin position'), 72, (1, 1000)),
 			# T: preference option for sourceview plugin
 		('tab_width', 'int', _('Tab width'), 4, (1, 80)),
+			# T: preference option for sourceview plugin
+		('wrap_mode', 'choice', _('Text wrap mode'), WRAP_WORD_CHAR, (WRAP_NONE, WRAP_WORD_CHAR, WRAP_CHAR, WRAP_WORD)),
+			# T: preference option for sourceview plugin
+		('theme', 'choice', _('Theme'), STYLES[0] if STYLES else 'not found',
+										STYLES if STYLES else ['not found']),
 			# T: preference option for sourceview plugin
 	)
 
@@ -200,6 +223,14 @@ class SourceViewWidget(TextViewWidget):
 		self.view.set_show_right_margin(True)
 		self.view.set_tab_width(4)
 		self.view.set_show_line_numbers(self.buffer.object_attrib['linenumbers'])
+		self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+
+		self.WRAP_MODE = {
+			WRAP_NONE: Gtk.WrapMode.NONE,
+			WRAP_WORD_CHAR: Gtk.WrapMode.WORD_CHAR,
+			WRAP_CHAR: Gtk.WrapMode.CHAR,
+			WRAP_WORD: Gtk.WrapMode.WORD,
+		}
 
 		# simple toolbar
 		#~ bar = Gtk.HBox() # FIXME: use Gtk.Toolbar stuff
@@ -235,12 +266,23 @@ class SourceViewWidget(TextViewWidget):
 		self.view.connect('populate-popup', self.on_populate_popup)
 
 	def set_preferences(self, preferences):
+
+		# set the style scheme
+		theme = preferences['theme']
+		try:
+			style_scheme = ssm.get_scheme(theme)
+			self.buffer.set_style_scheme(style_scheme)
+		except:
+			logger.exception('Could not set theme for sourceview: %s', theme)
+
+		# set other preferences
 		self.view.set_auto_indent(preferences['auto_indent'])
 		self.view.set_smart_home_end(preferences['smart_home_end'])
 		self.view.set_highlight_current_line(preferences['highlight_current_line'])
 		self.view.set_right_margin_position(preferences['right_margin_position'])
 		self.view.set_show_right_margin(preferences['show_right_margin'])
 		self.view.set_tab_width(preferences['tab_width'])
+		self.view.set_wrap_mode(self.WRAP_MODE[preferences['wrap_mode']])
 
 	def on_attrib_changed(self, attrib):
 		self.view.set_show_line_numbers(attrib['linenumbers'])

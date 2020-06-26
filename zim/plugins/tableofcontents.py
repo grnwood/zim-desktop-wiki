@@ -17,37 +17,50 @@ from zim.plugins import PluginClass
 from zim.signals import ConnectorMixin, DelayedCallback
 from zim.notebook import Path
 from zim.tokenparser import collect_untill_end_token, tokens_to_text
-from zim.formats import HEADING
+from zim.formats import HEADING, LINE
 
 from zim.gui.pageview import PageViewExtension
 from zim.gui.widgets import LEFT_PANE, PANE_POSITIONS, BrowserTreeView, populate_popup_add_separator, \
 	WindowSidePaneWidget, widget_set_css
-from zim.gui.pageview import FIND_REGEX, SCROLL_TO_MARK_MARGIN, _is_heading_tag
+from zim.gui.pageview import FIND_REGEX, SCROLL_TO_MARK_MARGIN, _is_heading_tag, LineSeparatorAnchor
 
+LINE_LEVEL = 2  # assume level 1 is page heading, level 2 is topic break within page
 
 # FIXME, these methods should be supported by pageview - need anchors - now it is a HACK
-_is_heading = lambda iter: bool(list(filter(_is_heading_tag, iter.get_tags())))
 
-def find_heading(buffer, n):
+def _is_heading_or_line(iter, include_hr):
+	if list(filter(_is_heading_tag, iter.get_tags())):
+		return True
+	elif not include_hr:
+		return False
+	else:
+		anchor = iter.get_child_anchor()
+		if anchor and  isinstance(anchor, LineSeparatorAnchor):
+			return True
+		else:
+			return False
+
+
+def find_heading(buffer, n, include_hr):
 	'''Find the C{n}th heading in the buffer
 	@param buffer: the C{Gtk.TextBuffer}
 	@param n: an integer
 	@returns: a C{Gtk.TextIter} for the line start of the heading or C{None}
 	'''
 	iter = buffer.get_start_iter()
-	i = 1 if _is_heading(iter) else 0
+	i = 1 if _is_heading_or_line(iter, include_hr) else 0
 	while i < n:
 		iter.forward_line()
-		while not _is_heading(iter):
+		while not _is_heading_or_line(iter, include_hr):
 			if not iter.forward_line():
 				return None
 		i += 1
 	return iter
 
 
-def select_heading(buffer, n):
+def select_heading(buffer, n, include_hr):
 	'''Select the C{n}th heading in the buffer'''
-	iter = find_heading(buffer, n)
+	iter = find_heading(buffer, n, include_hr)
 	if iter:
 		buffer.place_cursor(iter)
 		buffer.select_line()
@@ -56,7 +69,7 @@ def select_heading(buffer, n):
 		return False
 
 
-def get_headings(parsetree):
+def get_headings(parsetree, include_hr):
 	tokens = parsetree.iter_tokens()
 	stack = [(0, None, [])]
 	for t in tokens:
@@ -68,6 +81,13 @@ def get_headings(parsetree):
 			while stack[-1][0] >= level:
 				stack.pop()
 			node = (level, text, [])
+			stack[-1][2].append(node)
+			stack.append(node)
+		elif include_hr and t[0] == LINE:
+			while stack[-1][0] >= LINE_LEVEL:
+				stack.pop()
+			node = (LINE_LEVEL, '\u2500\u2500\u2500\u2500', [])
+				# \u2500 == "BOX DRAWINGS LIGHT HORIZONTAL"
 			stack[-1][2].append(node)
 			stack.append(node)
 		else:
@@ -99,6 +119,10 @@ This is a core plugin shipping with zim.
 			# T: option for plugin preferences
 		('show_h1', 'bool', _('Show the page title heading in the ToC'), False),
 			# T: option for plugin preferences
+		('include_hr', 'bool', _('Include horizontal lines in the ToC'), True),
+			# T: option for plugin preferences
+		('fontsize', 'int', _('Set ToC fontsize'), 0, (0, 24)),
+			# T: option for plugin preferences
 	)
 	# TODO disable pane setting if not embedded
 
@@ -122,26 +146,37 @@ class ToCPageViewExtension(PageViewExtension):
 			if isinstance(self.tocwidget, SidePaneToC):
 				self.add_sidepane_widget(self.tocwidget, 'pane')
 
-		self.tocwidget.set_show_h1(preferences['show_h1'])
+		self.tocwidget.set_preferences(
+			preferences['show_h1'],
+			preferences['include_hr'],
+			preferences['fontsize']
+		)
 
 
 TEXT_COL = 0
 
 class ToCTreeView(BrowserTreeView):
 
-	def __init__(self, ellipsis):
+	def __init__(self, ellipsis, fontsize):
 		BrowserTreeView.__init__(self, ToCTreeModel())
 		self.set_headers_visible(False)
 		self.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
 			# Allow select multiple
 
 		cell_renderer = Gtk.CellRendererText()
+		if fontsize > 0:
+			cell_renderer.set_property('size-points', fontsize)
 		if ellipsis:
 			cell_renderer.set_property('ellipsize', Pango.EllipsizeMode.END)
 		column = Gtk.TreeViewColumn('_heading_', cell_renderer, text=TEXT_COL)
 		column.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
 			# Without this sizing, column width only grows and never shrinks
+		self._cell_renderer = cell_renderer
 		self.append_column(column)
+
+	def set_fontsize(self, fontsize):
+		if fontsize != 0:
+			self._cell_renderer.set_property('size-points', fontsize)
 
 
 class ToCTreeModel(Gtk.TreeStore):
@@ -246,11 +281,13 @@ class ToCWidget(ConnectorMixin, Gtk.ScrolledWindow):
 		'changed': (GObject.SignalFlags.RUN_LAST, None, ()),
 	}
 
-	def __init__(self, pageview, ellipsis, show_h1=False):
+	def __init__(self, pageview, ellipsis, show_h1=False, include_hr=True, fontsize=0):
 		GObject.GObject.__init__(self)
 		self.show_h1 = show_h1
+		self.include_hr = include_hr
+		self.fontsize = fontsize
 
-		self.treeview = ToCTreeView(ellipsis)
+		self.treeview = ToCTreeView(ellipsis, fontsize)
 		self.treeview.connect('row-activated', self.on_heading_activated)
 		self.treeview.connect('populate-popup', self.on_populate_popup)
 		self.add(self.treeview)
@@ -262,11 +299,14 @@ class ToCWidget(ConnectorMixin, Gtk.ScrolledWindow):
 		if self.pageview.page:
 			self.load_page(self.pageview.page)
 
-	def set_show_h1(self, show_h1):
-		if show_h1 != self.show_h1:
-			self.show_h1 = show_h1
-			if self.pageview.page:
-				self.load_page(self.pageview.page)
+	def set_preferences(self, show_h1, include_hr, fontsize):
+		changed = (show_h1, include_hr, fontsize) != (self.show_h1, self.include_hr, self.fontsize)
+		self.show_h1 = show_h1
+		self.include_hr = include_hr
+		self.fontsize = fontsize
+		self.treeview.set_fontsize(fontsize)
+		if changed and self.pageview.page:
+			self.load_page(self.pageview.page)
 
 	def on_page_changed(self, pageview, page):
 		self.load_page(page)
@@ -282,7 +322,7 @@ class ToCWidget(ConnectorMixin, Gtk.ScrolledWindow):
 		if tree is None:
 			model.clear()
 		else:
-			model.update(get_headings(tree), self.show_h1)
+			model.update(get_headings(tree, self.include_hr), self.show_h1)
 		self.emit('changed')
 
 	def on_heading_activated(self, treeview, path, column):
@@ -297,7 +337,7 @@ class ToCWidget(ConnectorMixin, Gtk.ScrolledWindow):
 
 		textview = self.pageview.textview
 		buffer = textview.get_buffer()
-		if select_heading(buffer, n):
+		if select_heading(buffer, n, self.include_hr):
 			textview.scroll_to_mark(buffer.get_insert(), SCROLL_TO_MARK_MARGIN, False, 0, 0)
 			return True
 		else:
@@ -321,10 +361,10 @@ class ToCWidget(ConnectorMixin, Gtk.ScrolledWindow):
 
 		textview = self.pageview.textview
 		buffer = textview.get_buffer()
-		start = find_heading(buffer, n)
+		start = find_heading(buffer, n, self.include_hr)
 		if start is None:
 			return
-		end = find_heading(buffer, n + 1)
+		end = find_heading(buffer, n + 1, self.include_hr)
 		if end is None:
 			end = buffer.get_end_iter()
 
@@ -503,8 +543,8 @@ class FloatingToC(Gtk.VBox, ConnectorMixin):
 
 		self._event_box.show_all()
 
-	def set_show_h1(self, show_h1):
-		self.tocwidget.set_show_h1(show_h1)
+	def set_preferences(self, show_h1, include_hr, fontsize):
+		self.tocwidget.set_preferences(show_h1, include_hr, fontsize)
 
 	def disconnect_all(self):
 		self.tocwidget.disconnect_all()

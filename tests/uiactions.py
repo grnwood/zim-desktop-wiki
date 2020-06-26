@@ -206,7 +206,7 @@ class TestUIActions(tests.TestCase):
 			dialog.assert_response_ok()
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page()
+			self.uiactions.move_page()
 
 		page = self.notebook.get_page(Path('Test'))
 		self.assertFalse(page.exists())
@@ -221,7 +221,7 @@ class TestUIActions(tests.TestCase):
 			self.assertFalse(dialog.do_response_ok())
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page()
+			self.uiactions.move_page()
 
 	def testRenamePageFailsForExistingPage(self):
 		from zim.notebook import PageExistsError
@@ -231,7 +231,7 @@ class TestUIActions(tests.TestCase):
 			self.assertRaises(PageExistsError, dialog.do_response_ok)
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page()
+			self.uiactions.move_page()
 
 	def testRenamePageNonExistingPageFails(self):
 		from zim.notebook import PageNotFoundError
@@ -242,13 +242,13 @@ class TestUIActions(tests.TestCase):
 			self.assertRaises(PageNotFoundError, dialog.do_response_ok)
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page(page)
+			self.uiactions.move_page(page)
 
 	def testRenamePageWithPageUpdateHeading(self):
 		page = self.notebook.get_page(Path('MyPage'))
 		page.parse('wiki', ['======= MyPage =======\n', 'Test 123\n'])
 		tree = page.get_parsetree()
-		self.assertEqual(tree.get_heading(), 'MyPage')
+		self.assertEqual(tree.get_heading_text(), 'MyPage')
 		self.notebook.store_page(page)
 
 		def renamepage(dialog):
@@ -258,17 +258,17 @@ class TestUIActions(tests.TestCase):
 			dialog.assert_response_ok()
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page(page)
+			self.uiactions.move_page(page)
 
 		page = self.notebook.get_page(Path('NewName'))
 		tree = page.get_parsetree()
-		self.assertEqual(tree.get_heading(), 'NewName')
+		self.assertEqual(tree.get_heading_text(), 'NewName')
 
 	def testRenamePageWithPageKeepHeading(self):
 		page = self.notebook.get_page(Path('MyPage'))
 		page.parse('wiki', ['======= MyPage =======\n', 'Test 123\n'])
 		tree = page.get_parsetree()
-		self.assertEqual(tree.get_heading(), 'MyPage')
+		self.assertEqual(tree.get_heading_text(), 'MyPage')
 		self.notebook.store_page(page)
 
 		def renamepage(dialog):
@@ -278,27 +278,27 @@ class TestUIActions(tests.TestCase):
 			dialog.assert_response_ok()
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page(page)
+			self.uiactions.move_page(page)
 
 		page = self.notebook.get_page(Path('NewName'))
 		tree = page.get_parsetree()
-		self.assertEqual(tree.get_heading(), 'MyPage')
+		self.assertEqual(tree.get_heading_text(), 'MyPage')
 
 	def testRenamePageAddHeading(self):
 		# Default test page does not have an heading
 		tree = self.page.get_parsetree()
-		self.assertEqual(tree.get_heading(), '')
+		self.assertEqual(tree.get_heading_text(), '')
 
 		def renamepage(dialog):
 			dialog.set_input(name='NewName', head=True)
 			dialog.assert_response_ok()
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page()
+			self.uiactions.move_page()
 
 		page = self.notebook.get_page(Path('NewName'))
 		tree = page.get_parsetree()
-		self.assertEqual(tree.get_heading(), 'NewName')
+		self.assertEqual(tree.get_heading_text(), 'NewName')
 
 	def testRenamePageUpdateLinks(self):
 		referrer = self.notebook.get_page(Path('Referrer'))
@@ -312,7 +312,7 @@ class TestUIActions(tests.TestCase):
 			dialog.assert_response_ok()
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page()
+			self.uiactions.move_page()
 
 		self.assertEqual(referrer.dump('wiki'), ['Test [[NewName]]\n'])
 
@@ -328,7 +328,7 @@ class TestUIActions(tests.TestCase):
 			dialog.assert_response_ok()
 
 		with tests.DialogContext(renamepage):
-			self.uiactions.rename_page()
+			self.uiactions.move_page()
 
 		self.assertEqual(referrer.dump('wiki'), ['Test [[Test]]\n'])
 
@@ -607,70 +607,6 @@ class TestUIActions(tests.TestCase):
 			self.uiactions.show_recent_changes()
 
 		self.assertEqual(self.navigation.opened, Path('NewPage'))
-
-	def testAttachFile(self):
-		folder = self.setUpFolder(mock=tests.MOCK_ALWAYS_REAL)
-		file = folder.file('Attachment.abc')
-		file.write('Test ABC\n')
-
-		def attach_file(dialog):
-			dialog.set_file(file)
-			dialog.assert_response_ok()
-
-		with tests.DialogContext(attach_file):
-			self.uiactions.attach_file()
-
-		attach_folder = self.notebook.get_attachments_dir(self.page)
-		attach_file = attach_folder.file('Attachment.abc')
-		self.assertTrue(attach_file.exists())
-		self.assertEqual(attach_file.read(), file.read())
-
-	def testAttachFileResolveExistingFile(self):
-		folder = self.setUpFolder(mock=tests.MOCK_ALWAYS_REAL)
-		file = folder.file('Attachment.abc')
-		file.write('Test ABC\n')
-
-		attach_folder = self.notebook.get_attachments_dir(self.page)
-		conflict_file = attach_folder.file('Attachment.abc')
-		conflict_file.write('Conflict\n')
-
-		def attach_file(dialog):
-			dialog.set_file(file)
-			dialog.assert_response_ok()
-
-		def resolve_conflict(dialog):
-			dialog.set_input(name='NewName.abc')
-			dialog.assert_response_ok()
-
-		with tests.DialogContext(attach_file, resolve_conflict):
-			self.uiactions.attach_file()
-
-		attach_file = attach_folder.file('NewName.abc')
-		self.assertTrue(attach_file.exists())
-		self.assertEqual(attach_file.read(), file.read())
-
-		self.assertEqual(conflict_file.read(), 'Conflict\n')
-
-	def testAttachFileOverwriteExistingFile(self):
-		folder = self.setUpFolder(mock=tests.MOCK_ALWAYS_REAL)
-		file = folder.file('Attachment.abc')
-		file.write('Test ABC\n')
-
-		attach_folder = self.notebook.get_attachments_dir(self.page)
-		conflict_file = attach_folder.file('Attachment.abc')
-		conflict_file.write('Conflict\n')
-
-		def attach_file(dialog):
-			dialog.set_file(file)
-			dialog.assert_response_ok()
-
-		def resolve_conflict(dialog):
-			dialog.do_response_overwrite()
-
-		with tests.DialogContext(attach_file, resolve_conflict):
-			self.uiactions.attach_file()
-
-		self.assertEqual(conflict_file.read(), file.read())
 
 	def testShowServerDialog(self):
 		from zim.main import ZIM_APPLICATION

@@ -13,6 +13,7 @@ import logging
 from functools import partial
 
 from zim.notebook import Path
+from zim.notebook.index.base import TreeModelMixinBase
 from zim.notebook.index.pages import PagesTreeModelMixin, PageIndexRecord, IndexNotFoundError, IS_PAGE
 
 from zim.plugins import PluginClass
@@ -26,6 +27,7 @@ from zim.gui.clipboard import Clipboard, pack_urilist, unpack_urilist, \
 	INTERNAL_PAGELIST_TARGET_NAME, INTERNAL_PAGELIST_TARGET
 from zim.gui.uiactions import UIActions, PAGE_EDIT_ACTIONS, PAGE_ROOT_ACTIONS
 
+import zim.gui.clipboard
 
 logger = logging.getLogger('zim.gui.pageindex')
 
@@ -59,6 +61,10 @@ This plugin adds the page index pane to the main window.
 		('pane', 'choice', _('Position in the window'), LEFT_PANE, PANE_POSITIONS),
 		('ignore_journal', 'bool', _('Disconnect Journal pane from updating Page Index'), False), # T: preferences option
 			# T: preferences option
+		('autoexpand', 'bool', _('Automatically expand sections on open page'), True),
+			# T: preferences option
+		('autocollapse', 'bool', _('Automatically collapse sections on close page'), True),
+			# T: preferences option
 	)
 
 
@@ -71,6 +77,7 @@ class PageIndexPageViewExtension(PageViewExtension):
 		self.treeview = PageTreeView(pageview.notebook, self.navigation)
 		self.treeview.set_model(model)
 		self.widget = PageIndexWidget(self.treeview)
+		self._autoexpanded = None
 
 		# Connect to ui signals
 		#window.connect('start-index-update', lambda o: self.disconnect_model())
@@ -85,10 +92,23 @@ class PageIndexPageViewExtension(PageViewExtension):
 		# 	lambda v, p: self.pageview.insert_links([p]))
 
 	def on_page_changed(self, pageview, page):
-		if page and self.plugin.preferences['ignore_journal'] and not page.name.startswith('Journal'):
-			treepath = self.treeview.set_current_page(page, vivificate=True)
-			if treepath:
-				self.treeview.select_treepath(treepath)
+		treepath = self.treeview.set_current_page(page, vivificate=True)
+
+		if self._autoexpanded and self.plugin.preferences['autocollapse']:
+			ref1, ref2 = self._autoexpanded
+			if ref1.valid() and (ref2 is None or ref2.valid()):
+				prev_treepath = ref1.get_path()
+				prev_expanded_path = ref2.get_path() if ref2 else None
+				self.treeview.restore_expanded_path(prev_treepath, prev_expanded_path)
+
+		if treepath and self.plugin.preferences['autoexpand']:
+			expanded_path = self.treeview.get_expanded_path(treepath)
+			model = self.treeview.get_model()
+			ref1 = Gtk.TreeRowReference(model, treepath)
+			ref2 = Gtk.TreeRowReference(model, expanded_path) if expanded_path else None
+			self._autoexpanded = (ref1, ref2)
+			self.treeview.select_treepath(treepath)
+>>>>>>> upstream/master
 
 	def disconnect_model(self):
 		'''Stop the widget from listening to the index. Used e.g. to
@@ -104,6 +124,7 @@ class PageIndexPageViewExtension(PageViewExtension):
 		reloading the index to get rid of out-of-sync model errors
 		without need to close the app first.
 		'''
+		self.treeview.disconnect_index()
 		model = PageTreeStore(self.pageview.notebook.index)
 		self.treeview.set_model(model)
 
@@ -408,7 +429,9 @@ class PageTreeView(BrowserTreeView):
 		model = self.get_model()
 		if isinstance(model, Gtk.TreeModelFilter):
 			model = model.get_model() # get childmodel
-		model.teardown()
+
+		if isinstance(model, TreeModelMixinBase):
+			model.teardown()
 
 	def do_row_activated(self, treepath, column):
 		model = self.get_model()
@@ -478,10 +501,16 @@ class PageTreeView(BrowserTreeView):
 		logger.debug('Drag data requested, we have internal path "%s"', path.name)
 		data = pack_urilist((path.name,))
 		selectiondata.set(selectiondata.get_target(), 8, data)
+		zim.gui.clipboard._internal_selection_data = data # HACK issue #390
 
 	def do_drag_data_received(self, dragcontext, x, y, selectiondata, info, time):
 		assert selectiondata.get_target().name() == INTERNAL_PAGELIST_TARGET_NAME
-		names = unpack_urilist(selectiondata.get_data())
+		data = selectiondata.get_data()
+		if data is None:
+			data = zim.gui.clipboard._internal_selection_data # HACK issue #390
+			zim.gui.clipboard._internal_selection_data = None
+
+		names = unpack_urilist(data)
 		assert len(names) == 1
 		source = Path(names[0])
 
@@ -563,3 +592,31 @@ class PageTreeView(BrowserTreeView):
 			return None
 		else:
 			return model.get_indexpath(iter)
+
+	def get_expanded_path(self, path):
+		'''Return the lowest expanded path towards C{path}'''
+		path = path.copy()
+		while path and not self.row_expanded(path):
+			if path.get_depth() == 1:
+				path = None
+			else:
+				path.up()
+		return path
+
+	def restore_expanded_path(self, path, expanded_path):
+		'''Collaps path between C{path} and C{expanded_path}'''
+		path = path.copy()
+		if expanded_path is None:
+			while path:
+				self.collapse_row(path)
+				if path.get_depth() == 1:
+					path = None
+				else:
+					path.up()
+		else:
+			while path.compare(expanded_path) == 1: # else equal or deeper
+				self.collapse_row(path)
+				if path.get_depth() == 1:
+					path = None
+				else:
+					path.up()
