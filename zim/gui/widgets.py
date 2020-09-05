@@ -749,8 +749,8 @@ def button_set_statusbar_style(button):
 	# Set up a style for the statusbar variant to decrease spacing of the button
 	widget_set_css(button, 'zim-statusbar-button',	'''
 													border: none;
-													border-radius: 0px; 
-													padding: 0px 8px 0px 8px; 
+													border-radius: 0px;
+													padding: 0px 8px 0px 8px;
 													''')
 	button.set_relief(Gtk.ReliefStyle.NONE)
 
@@ -832,7 +832,7 @@ class MenuButton(Gtk.HBox):
 		self.button.handler_unblock(self._clicked_signal)
 		self.menu.connect('deactivate', self._deactivate_menu)
 		self.menu.show_all()
-		self.menu.set_property('rect_anchor_dx', -1) # This is needed to line up menu with borderless button 
+		self.menu.set_property('rect_anchor_dx', -1) # This is needed to line up menu with borderless button
 		self.menu.popup_at_widget(self, Gdk.Gravity.NORTH_WEST, Gdk.Gravity.SOUTH_WEST, event)
 
 	def _deactivate_menu(self, menu):
@@ -1772,7 +1772,11 @@ class PageEntry(InputEntry):
 		'''
 		if self.subpaths_only:
 			assert path.ischild(self.notebookpath)
-		self.set_text(':' + path.name)
+			self.set_text('+' + path.relname(self.notebookpath))
+		elif path.isroot:
+			self.set_text('')
+		else:
+			self.set_text(':' + path.name)
 
 	def get_path(self):
 		'''Get the path shown in the widget.
@@ -1783,12 +1787,13 @@ class PageEntry(InputEntry):
 		@returns: a L{Path} object or C{None} is no valid path was entered
 		'''
 		name = self.get_text().strip()
-		if self._allow_select_root and (name == ':' or not name):
-			self.set_input_valid(True)
-			return Path(':')
-		elif not name:
-			self.set_input_valid(False)
-			return None
+		if not name or name == ':':
+		   if self._allow_select_root:
+			   self.set_input_valid(True)
+			   return Path(':')
+		   else:
+			   self.set_input_valid(False)
+			   return None
 		else:
 			if self.subpaths_only and name[0] not in ('+', ':'):
 				name = '+' + name
@@ -2159,6 +2164,7 @@ class WindowSidePane(Gtk.VBox):
 		assert widget.title is not None
 		widget.tab_key = key
 		self.notebook.append_page(widget, widget.get_title_label())
+		self.notebook.set_tab_reorderable(widget, True)
 		self._update_topbar()
 
 	def remove(self, widget):
@@ -2190,6 +2196,21 @@ class WindowSidePane(Gtk.VBox):
 			return True
 		else:
 			return Gtk.VBox.do_key_press_event(self, event)
+
+	def get_ordering(self):
+		return tuple(w.tab_key for w in self.notebook.get_children())
+
+	def set_ordering(self, ordering):
+		widgets = {w.tab_key: w for w in self.notebook.get_children()}
+		i = 0
+		for key in ordering:
+			if key in widgets:
+				widget = widgets.pop(key)
+				self.notebook.reorder_child(widget, i)
+				i += 1
+		# keys not mapped to a widget are skipped
+		# widgets not in the ordering will move towards the end but maintain
+		# their relative ordering
 
 
 class MinimizedTabs(object):
@@ -2291,7 +2312,7 @@ class WindowSidePaneWidget(ConnectorMixin):
 		return False
 
 
-from zim.config import ConfigDefinition, ConfigDefinitionByClass
+from zim.config import ConfigDefinition, ConfigDefinitionByClass, StringAllowEmpty
 
 class ConfigDefinitionPaneToggle(ConfigDefinition):
 
@@ -2531,15 +2552,27 @@ class Window(Gtk.Window):
 			default = self.get_pane_state(key)
 			self.uistate.define((
 				(key, ConfigDefinitionPaneState(default)),
+				(key + '_order', StringAllowEmpty(self._get_pane_ordering(key)))
 			))
 			self.set_pane_state(key, *self.uistate[key])
+			self._set_pane_ordering(key, self.uistate[key + '_order'])
 
 	def save_uistate(self):
 		assert self.uistate is not None
 		for key in (LEFT_PANE, RIGHT_PANE, TOP_PANE, BOTTOM_PANE):
 			if key in self.uistate:
 				self.uistate[key] = self.get_pane_state(key)
+				self.uistate[key + '_order'] = self._get_pane_ordering(key)
 			# else pass - init_uistate() not yet called (!?)
+
+	def _get_pane_ordering(self, key):
+		paned, pane, mini = self._zim_window_sidepanes[key]
+		return ','.join(pane.get_ordering())
+
+	def _set_pane_ordering(self, key, order):
+		if order: # could be None
+			paned, pane, mini = self._zim_window_sidepanes[key]
+			pane.set_ordering(order.split(','))
 
 	def get_pane_state(self, pane):
 		'''Returns the state of a side pane.
@@ -2780,6 +2813,7 @@ class Dialog(Gtk.Dialog, ConnectorMixin):
 
 	def __init__(self, parent, title,
 			buttons=Gtk.ButtonsType.OK_CANCEL, button=None,
+			use_default_button=False,
 			help_text=None, help=None,
 			defaultwindowsize=(-1, -1)
 		):
@@ -2844,14 +2878,17 @@ class Dialog(Gtk.Dialog, ConnectorMixin):
 			if button:
 				self.add_action_widget(button, Gtk.ResponseType.OK)
 			else:
-				self.add_button(OK_STR, Gtk.ResponseType.OK) # T: Button label
+				button = self.add_button(OK_STR, Gtk.ResponseType.OK) # T: Button label
 		elif buttons == Gtk.ButtonsType.CLOSE:
-			self.add_button(_('_Close'), Gtk.ResponseType.OK) # T: Button label
+			button = self.add_button(_('_Close'), Gtk.ResponseType.OK) # T: Button label
+			button.set_can_default(True)
 			self._no_ok_action = True
 		else:
 			assert False, 'BUG: unknown button type'
-		# TODO set Ok button as default widget
-		# see Gtk.Window.set_default()
+
+		if button and use_default_button:
+			button.set_can_default(True)
+			self.set_default_response(Gtk.ResponseType.OK)
 
 		if help_text:
 			self.add_help_text(help_text)

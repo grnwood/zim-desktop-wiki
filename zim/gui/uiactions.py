@@ -19,7 +19,7 @@ from zim.parsing import url_encode, URL_ENCODE_DATA
 from zim.templates import list_templates, get_template
 
 from zim.config import data_file, ConfigManager
-from zim.notebook import PageExistsError, NotebookOperation
+from zim.notebook import Path, PageExistsError, NotebookOperation
 from zim.notebook.index import IndexNotFoundError, LINK_DIR_BACKWARD
 
 from zim.actions import get_gtk_actiongroup
@@ -178,16 +178,7 @@ class UIActions(object):
 		)
 		_callback(self.widget, url)
 
-	@action(_('_Rename Page...'), accelerator='F2', menuhints='notebook:edit') # T: Menu item
-	def rename_page(self, path=None):
-		'''Menu action to show the L{RenamePageDialog}
-		@param path: a L{Path} object, or C{None} for the current
-		selected page
-		'''
-		if self.ensure_index_uptodate():
-			RenamePageDialog(self.widget, self.notebook, path or self.page).run()
-
-	@action(_('_Move Page...'), menuhints='notebook:edit') # T: Menu item
+	@action(_('_Rename or move Page...'), accelerator='F2', menuhints='notebook:edit') # T: Menu item
 	def move_page(self, path=None):
 		'''Menu action to show the L{MovePageDialog}
 		@param path: a L{Path} object, or C{None} to move to current
@@ -272,7 +263,7 @@ class UIActions(object):
 		from zim.gui.templateeditordialog import TemplateEditorDialog
 		TemplateEditorDialog(self.widget).run()
 
-	@action(_('Pr_eferences')) # T: Menu item
+	@action(_('Pr_eferences'), '<Primary>comma') # T: Menu item
 	def show_preferences(self):
 		'''Menu action to show the L{PreferencesDialog}'''
 		from zim.gui.preferencesdialog import PreferencesDialog
@@ -316,14 +307,6 @@ class UIActions(object):
 		from .recentchangesdialog import RecentChangesDialog
 		dialog = RecentChangesDialog.unique(self, self.widget, self.notebook, self.navigation)
 		dialog.present()
-
-	@action(_('Attach _File'), verb_icon='zim-attachment', menuhints='notebook:edit') # T: Menu item
-	def attach_file(self, path=None):
-		'''Menu action to show the L{AttachFileDialog}
-		@param path: a L{Path} object, or C{None} for the current
-		selected page
-		'''
-		AttachFileDialog(self.widget, self.notebook, path or self.page).run()
 
 	@action(_('Open Attachments _Folder')) # T: Menu item
 	def open_attachments_folder(self):
@@ -575,79 +558,15 @@ class SaveCopyDialog(FileDialog):
 		return True
 
 
-class RenamePageDialog(Dialog):
+class MovePageDialog(Dialog):
 
 	def __init__(self, widget, notebook, path):
-		Dialog.__init__(self, widget, _('Rename Page')) # T: Dialog title
+		Dialog.__init__(self, widget, _('Rename or Move Page')) # T: Dialog title
 		self.notebook = notebook
 		self.path = path
 		page = self.notebook.get_page(self.path)
 
 		label = Gtk.Label(label=_('Rename page "%s"') % self.path.name)
-			# T: label in 'rename page' dialog - %s is the page name
-		label.set_ellipsize(Pango.EllipsizeMode.END)
-		self.vbox.add(label)
-
-		try:
-			i = self.notebook.links.n_list_links_section(path, LINK_DIR_BACKWARD)
-		except IndexNotFoundError:
-			i = 0
-
-		label = ngettext(
-			'Update %i page linking to this page',
-			'Update %i pages linking to this page', i) % i
-			# T: label in MovePage dialog - %i is number of backlinks
-			# TODO update label to reflect that links can also be to child pages
-
-		self.add_form([
-			('name', 'string', _('Name')),
-				# T: Input label in the 'rename page' dialog for the new name
-			('head', 'bool', _('Update the heading of this page')),
-				# T: Option in the 'rename page' dialog
-			('update', 'bool', label),
-				# T: Option in the 'rename page' dialog
-		], {
-			'name': self.path.basename,
-			'head': page.heading_matches_pagename(),
-			'update': True,
-		})
-
-		if not page.exists():
-			self.form['head'] = False
-			self.form.widgets['head'].set_sensitive(False)
-
-		if i == 0:
-			self.form['update'] = False
-			self.form.widgets['update'].set_sensitive(False)
-
-	def do_response_ok(self):
-		name = self.form['name']
-		head = self.form['head']
-		update = self.form['update']
-
-		if name == self.path.basename:
-			return False
-
-		self.hide() # hide this dialog before showing the progressbar
-		op = NotebookOperation(
-			self.notebook,
-			_('Updating Links'), # T: label for progress dialog
-			self.notebook.rename_page_iter(self.path, name, head, update)
-		)
-		dialog = ProgressDialog(self, op)
-		dialog.run()
-
-		return True
-
-
-class MovePageDialog(Dialog):
-
-	def __init__(self, widget, notebook, path):
-		Dialog.__init__(self, widget, _('Move Page')) # T: Dialog title
-		self.notebook = notebook
-		self.path = path
-
-		label = Gtk.Label(label=_('Move page "%s"') % self.path.name)
 			# T: Heading in 'move page' dialog - %s is the page name
 		label.set_ellipsize(Pango.EllipsizeMode.END)
 		self.vbox.add(label)
@@ -663,11 +582,24 @@ class MovePageDialog(Dialog):
 			# T: label in MovePage dialog - %i is number of backlinks
 			# TODO update label to reflect that links can also be to child pages
 		self.add_form([
-			('parent', 'namespace', _('Section'), self.path.parent),
+			('name', 'string', _('Name')),
+				# T: Input label in the 'rename page' dialog for the new name
+			('parent', 'namespace', _('Location')),
 				# T: Input label for the section to move a page to
+			('head', 'bool', _('Update the heading of this page')),
+				# T: option in 'move page' dialog
 			('update', 'bool', label),
 				# T: option in 'move page' dialog
-		])
+		], {
+			'name': self.path.basename,
+			'parent': self.path.parent,
+			'head': page.heading_matches_pagename(),
+			'update': True,
+		})
+
+		if not page.exists():
+			self.form['head'] = False
+			self.form.widgets['head'].set_sensitive(False)
 
 		if i == 0:
 			self.form['update'] = False
@@ -676,17 +608,26 @@ class MovePageDialog(Dialog):
 			self.form['update'] = True
 
 	def do_response_ok(self):
+		name = self.form['name']
 		parent = self.form['parent']
+		head = self.form['head']
 		update = self.form['update']
-		newpath = parent + self.path.basename
-		if parent == self.path.parent:
+
+		newbasename = Path.makeValidPageName(name)
+		newpath = parent + newbasename if parent else Path(newbasename)
+		if newpath == self.path:
 			return False
 
 		self.hide() # hide this dialog before showing the progressbar
 		op = NotebookOperation(
 			self.notebook,
 			_('Updating Links'), # T: label for progress dialog
-			self.notebook.move_page_iter(self.path, newpath, update)
+			self.notebook.move_page_iter(
+				self.path,
+				newpath,
+				update_links=update,
+				update_heading=head
+			)
 		)
 		dialog = ProgressDialog(self, op)
 		dialog.run()
@@ -765,130 +706,6 @@ class DeletePageDialog(Dialog):
 		dialog = ProgressDialog(self, op)
 		dialog.run()
 
-		return True
-
-
-class AttachFileDialog(FileDialog):
-
-	def __init__(self, widget, notebook, path):
-		assert path, 'Need a page here'
-		FileDialog.__init__(self, widget, _('Attach File'), multiple=True) # T: Dialog title
-		self.notebook = notebook
-		self.path = path
-
-		self.add_shortcut(notebook, path)
-		self.load_last_folder()
-
-		dir = notebook.get_attachments_dir(path)
-		if dir is None:
-			ErrorDialog(_('Page "%s" does not have a folder for attachments') % self.path)
-				# T: Error dialog - %s is the full page name
-			raise Exception('Page "%s" does not have a folder for attachments' % self.path)
-
-	def do_response_ok(self):
-		files = self.get_files()
-		if not files:
-			return False
-
-		self.save_last_folder()
-
-		for i, file in enumerate(files):
-			file = attach_file(self, self.notebook, self.path, file)
-			if file is None:
-				return False # overwrite dialog was canceled
-
-		return True
-
-
-def attach_file(widget, notebook, path, file, force_overwrite=False):
-	folder = notebook.get_attachments_dir(path)
-	if folder is None:
-		raise Error('%s does not have an attachments dir' % path)
-
-	dest = folder.file(file.basename)
-	if dest.exists() and not force_overwrite:
-		dialog = PromptExistingFileDialog(widget, dest)
-		dest = dialog.run()
-		if dest is None:
-			return None	# dialog was cancelled
-		elif dest.exists():
-			dest.remove()
-
-	file.copyto(dest)
-	return dest
-
-
-class PromptExistingFileDialog(Dialog):
-	'''Dialog that is used e.g. when a file should be attached to zim,
-	but a file with the same name already exists in the attachment
-	directory. This Dialog allows to suggest a new name or overwrite
-	the existing one.
-
-	For this dialog C{run()} will return either the original file
-	(for overwrite), a new file, or None when the dialog was canceled.
-	'''
-
-	def __init__(self, widget, file):
-		Dialog.__init__(self, widget, _('File Exists'), buttons=None) # T: Dialog title
-		self.add_help_text( _('''\
-A file with the name <b>"%s"</b> already exists.
-You can use another name or overwrite the existing file.''' % file.basename),
-		) # T: Dialog text in 'new filename' dialog
-		self.folder = file.parent()
-		self.old_file = file
-
-		suggested_filename = self.folder.new_file(file.basename).basename
-		self.add_form((
-				('name', 'string', _('Filename')), # T: Input label
-			), {
-				'name': suggested_filename
-			}
-		)
-		self.form.widgets['name'].set_check_func(self._check_valid)
-
-		# all buttons are defined in this class, to get the ordering right
-		# [show folder]      [overwrite] [cancel] [ok]
-		button = Gtk.Button.new_with_mnemonic(_('_Browse')) # T: Button label
-		button.connect('clicked', self.do_show_folder)
-		self.action_area.add(button)
-		self.action_area.set_child_secondary(button, True)
-
-		button = Gtk.Button.new_with_mnemonic(_('Overwrite')) # T: Button label
-		button.connect('clicked', self.do_response_overwrite)
-		self.add_action_widget(button, Gtk.ResponseType.NONE)
-
-		self.add_button(_('_Cancel'), Gtk.ResponseType.CANCEL) # T: Button label
-		self.add_button(_('_OK'), Gtk.ResponseType.OK) # T: Button label
-		self._no_ok_action = False
-
-		self.form.widgets['name'].connect('focus-in-event', self._on_focus)
-
-	def _on_focus(self, widget, event):
-		# filename length without suffix
-		length = len(os.path.splitext(widget.get_text())[0])
-		widget.select_region(0, length)
-
-	def _check_valid(self, filename):
-		# Only valid when same dir and does not yet exist
-		file = self.folder.file(filename)
-		return file.ischild(self.folder) and not file.exists()
-
-	def do_show_folder(self, *a):
-		open_folder(self, self.folder)
-
-	def do_response_overwrite(self, *a):
-		logger.info('Overwriting %s', self.old_file.path)
-		self.result = self.old_file
-
-	def do_response_ok(self):
-		if not self.form.widgets['name'].get_input_valid():
-			return False
-
-		newfile = self.folder.file(self.form['name'])
-		logger.info('Selected %s', newfile.path)
-		assert newfile.ischild(self.folder) # just to be real sure
-		assert not newfile.exists() # just to be real sure
-		self.result = newfile
 		return True
 
 

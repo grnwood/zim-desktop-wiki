@@ -4,7 +4,7 @@ Creation-Date: Unknown
 
 ====== Downloads ======
 
-===== Latest release: 0.72.1 - Jan 2020 =====
+===== Latest release: 0.73.1 - Jun 2020 =====
 
 **This program depends on a number of prerequisites.** Most linux distributions have standard packages for these bindings, if your distribution has these packages installing them will probably be much easier then compiling them manually .
 
@@ -32,6 +32,16 @@ There is also a PPA with updates for zim [[https://launchpad.net/~jaap.karssenbe
 {{/images/os-windows.gif?width=24}}  **Windows**
 
 A windows installer can be found [[https://zim.glump.net/windows/|here]].
+
+{{/images/os-apple.png?width=24}}  ** Mac OS X**
+
+On Mac OS X, zim can be installed from Homebrew using,
+
+'''
+brew install zim
+'''
+
+Optionally, you can [[https://github.com/jaap-karssenberg/zim-wiki/wiki/Mac-OSX-App-%28wrapper%29|create a .app wrapper]] for convenience.
 
 {{/images/package-x-generic.png?width=24}}  **Other Distributions**
 

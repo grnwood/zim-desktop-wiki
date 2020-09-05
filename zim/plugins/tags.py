@@ -1,5 +1,5 @@
 
-# Copyright 2010 Fabian Moser
+# Copyright 2010 Fabian Stanke
 # Copyright 2011-2017 Jaap Karssenberg
 
 
@@ -27,6 +27,7 @@ from zim.gui.widgets import LEFT_PANE, PANE_POSITIONS, populate_popup_add_separa
 	WindowSidePaneWidget
 from zim.gui.clipboard import pack_urilist, INTERNAL_PAGELIST_TARGET_NAME
 
+import zim.gui.clipboard
 
 logger = logging.getLogger('zim.plugins.tags')
 
@@ -39,7 +40,7 @@ class TagsPlugin(PluginClass):
 		'description': _('''\
 This plugin provides a page index filtered by means of selecting tags in a cloud.
 '''), # T: plugin description
-		'author': 'Fabian Moser & Jaap Karssenberg',
+		'author': 'Fabian Stanke & Jaap Karssenberg',
 		'help': 'Plugins:Tags',
 	}
 
@@ -169,8 +170,9 @@ class TagsPluginWidget(Gtk.VPaned, WindowSidePaneWidget):
 		without need to close the app first.
 		'''
 		assert self.uistate['treeview'] in ('tagged', 'tags')
-		tags = [t.name for t in self.tagcloud.get_tag_filter()]
+		self.treeview.disconnect_index()
 
+		tags = [t.name for t in self.tagcloud.get_tag_filter()]
 		if tags:
 			model = TaggedPageTreeStore(self.index, tags, self.uistate['show_full_page_name'])
 		elif self.uistate['treeview'] == 'tags':
@@ -179,6 +181,12 @@ class TagsPluginWidget(Gtk.VPaned, WindowSidePaneWidget):
 			model = PageTreeStore(self.index)
 
 		self.treeview.set_model(model)
+
+		def handler(o, *a):
+			signal = a[-1]
+			path = a[0].to_string()
+		for signal in ('row-inserted', 'row-changed', 'row-deleted', 'row-has-child-toggled'):
+			model.connect(signal, handler, signal)
 
 
 class DuplicatePageTreeStore(PageTreeStoreBase):
@@ -284,6 +292,7 @@ class TagsPageTreeView(PageTreeView):
 		logger.debug('Drag data requested, we have internal tag/path "%s"', link)
 		data = pack_urilist((link,))
 		selectiondata.set(selectiondata.get_target(), 8, data)
+		zim.gui.clipboard._internal_selection_data = data # HACK issue #390
 
 	def set_current_page(self, path, vivificate=False):
 		'''Set the current page in the treeview

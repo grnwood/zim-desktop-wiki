@@ -1,5 +1,5 @@
 
-# Copyright 2008, 2012 Jaap Karssenberg <jaap.karssenberg@gmail.com>
+# Copyright 2008, 2012-2019 Jaap Karssenberg <jaap.karssenberg@gmail.com>
 
 '''This module handles parsing and dumping wiki text'''
 
@@ -8,14 +8,24 @@ import logging
 
 logger = logging.getLogger('zim.formats.wiki')
 
-from zim.parser import *
-from zim.parsing import url_re, url_encode, URL_ENCODE_DATA, \
+from zim.parser import Rule, fix_line_end, convert_space_to_tab
+from zim.parser import Parser as RuleParser
+from zim.parsing import url_encode, URL_ENCODE_DATA, \
 	escape_string, unescape_string, split_escaped_string
+from zim.parsing import url_re as old_url_re
 from zim.formats import *
 from zim.formats.plain import Dumper as TextDumper
 
+old_url_re = old_url_re.p
 
-WIKI_FORMAT_VERSION = 'zim 0.4'
+
+WIKI_FORMAT_VERSION = 'zim 0.6'
+assert WIKI_FORMAT_VERSION != 'zim 0.26' # skip number for historic reasons
+# History:
+# - 0.6  new url parsing logic
+# - 0.5  support nested formatting
+# - 0.4  parser rewrite, specifically changed parsing indented blocks
+# - 0.26 oldest format supported in python branch
 
 
 info = {
@@ -66,6 +76,94 @@ def _remove_indent(text, indent):
 		# supported in python 2.6
 
 
+# NOTE: we follow rules of GFM spec, except:
+#  - we allow any URL scheme
+#  - we add a file URI match
+# For GFM Markdown parser, remove these exceptions
+#
+# File paths cannot contain '\', '/', ':', '*', '?', '"', '<', '>', '|'
+# These are valid URL / path seperators: / \ : ? |
+# So restrict matching " < > and also '
+url_re = re.compile(
+	'\\b(?P<url>'
+
+	'(www\.|https?://|\w+://)'			# autolink & autourl prefix
+	'(?P<domain>([\w\-]+\.)+[\w\-]+)' 	# 2 or more domain sections
+	'[^\s<]*'					# any non-space char except "<"
+
+	')|(?P<email>'
+
+	'(mailto:)?'
+	'[\w\.\-_+]+@'				# email prefix
+	'([\w\-_]+\.)+[\w\-_]+'	# email domain
+
+	')|(?P<fileuri>'
+
+	'file:/+'
+	'[^\s"<>\']+'
+
+	')', re.U
+)
+
+url_trailing_punctuation = ('?', '!', '.', ',', ':', '*', '_', '~')
+
+
+def is_url(text):
+	'''Matches url_re and number of closing brackets matches
+	See L{https://github.github.com/gfm/#autolinks-extension-}
+	@param text: text to match as url
+	@returns: C{True} if C{text} is a valid url according to GFM rules
+	'''
+	url = match_url(text)
+	return url == text # No trailing puntuation or ")" excluded
+
+
+def match_url(text):
+	'''Match regex and count number of closing brackets
+	See L{https://github.github.com/gfm/#autolinks-extension-}
+	@param text: text to match as url
+	@returns: the url or None
+	'''
+	m = url_re.match(text)
+	if m:
+		url = m.group(0)
+		if m.lastgroup == 'email':
+			# Do not allow end in "-" or "_", use trailing "."
+			while url:
+				if url[-1] == '.':
+					url = url[:-1]
+				elif url[-1] in ('-', '_'):
+					return None
+				else:
+					break
+			return url or None
+
+		# continue processing regular URL or file URI
+		if m.lastgroup == 'url':
+			domain = m.group('domain').split('.')
+			if '_' in domain[-1] or '_' in domain[-2]:
+				# Last two domain sections cannot contain "_"
+				return None
+	else:
+		return None
+
+	while url:
+		if url[-1] in url_trailing_punctuation \
+			or (url[-1] == ')' and url.count(')') > url.count('(')):
+				url = url[:-1]
+		elif url[-1] == ';':
+			m = re.search('&\w+;$', url)
+			if m:
+				ref = m.group(0)
+				url = url[:-len(ref)]
+			else:
+				url = url[:-1]
+		else:
+			return url
+	else:
+		return None
+
+
 class WikiParser(object):
 	# This parser uses 3 levels of rules. The top level splits up
 	# paragraphs, verbatim paragraphs, images and objects.
@@ -81,7 +179,9 @@ class WikiParser(object):
 		'*': BULLET,
 	}
 
-	def __init__(self):
+	def __init__(self, backward_indented_blocks=False, backward_url_parsing=False):
+		self.backward_indented_blocks = backward_indented_blocks
+		self.backward_url_parsing = backward_url_parsing
 		self.inline_parser = self._init_inline_parse()
 		self.list_and_indent_parser = self._init_intermediate_parser()
 		self.block_parser = self._init_block_parser()
@@ -93,25 +193,33 @@ class WikiParser(object):
 
 	def _init_inline_parse(self):
 		# Rules for inline formatting, links and tags
-		return (
-			Rule(LINK, url_re.r, process=self.parse_url) # FIXME need .r atribute because url_re is a Re object
-			| Rule(TAG, r'(?<!\S)@\w+', process=self.parse_tag)
-			| Rule(LINK, r'\[\[(?!\[)(.*?)\]\]', process=self.parse_link)
-			| Rule(IMAGE, r'\{\{(?!\{)(.*?)\}\}', process=self.parse_image)
-			| Rule(EMPHASIS, r'//(?!/)(.*?)//')
-			| Rule(STRONG, r'\*\*(?!\*)(.*?)\*\*')
-			| Rule(MARK, r'__(?!_)(.*?)__')
-			| Rule(SUBSCRIPT, r'_\{(?!~)(.+?)\}')
-			| Rule(SUPERSCRIPT, r'\^\{(?!~)(.+?)\}')
-			| Rule(STRIKE, r'~~(?!~)(.+?)~~')
+		my_url_re = old_url_re if self.backward_url_parsing else url_re
+		descent = lambda *a: self.inline_parser(*a)
+
+		self.nested_inline_parser = (
+			Rule(TAG, r'(?<!\S)@\w+', process=self.parse_tag)
+			| Rule(EMPHASIS, r'//(?!/)(.*?)(?<!:)//', descent=descent) # no ':' at the end (ex: 'http://')
+			| Rule(STRONG, r'\*\*(?!\*)(.*?)\*\*', descent=descent)
+			| Rule(MARK, r'__(?!_)(.*?)__', descent=descent)
+			| Rule(SUBSCRIPT, r'_\{(?!~)(.+?)\}', descent=descent)
+			| Rule(SUPERSCRIPT, r'\^\{(?!~)(.+?)\}', descent=descent)
+			| Rule(STRIKE, r'~~(?!~)(.+?)~~', descent=descent)
 			| Rule(VERBATIM, r"''(?!')(.+?)''")
+
+		)
+
+		return (
+			Rule(LINK, my_url_re, process=self.parse_url)
+			| Rule(LINK, r'\[\[(?!\[)(.*?\]*)\]\]', process=self.parse_link)
+			| Rule(IMAGE, r'\{\{(?!\{)(.*?)\}\}', process=self.parse_image)
+			| self.nested_inline_parser
 		)
 
 	def _init_intermediate_parser(self):
 		# Intermediate level, breaks up lists and indented blocks
 		# TODO: deprecate this by taking lists out of the para
 		#       and make a new para for each indented block
-		p = Parser(
+		p = RuleParser(
 			Rule(
 				'X-Bullet-List',
 				r'''(
@@ -148,7 +256,7 @@ class WikiParser(object):
 
 	def _init_block_parser(self):
 		# Top level parser, to break up block level items
-		p = Parser(
+		p = RuleParser(
 			Rule(VERBATIM_BLOCK, r'''
 				^(?P<pre_indent>\t*) \'\'\' \s*?				# 3 "'"
 				( (?:^.*\n)*? )									# multi-line text
@@ -182,8 +290,7 @@ class WikiParser(object):
 		p.process_unmatched = self.parse_para
 		return p
 
-	@staticmethod
-	def parse_heading(builder, text):
+	def parse_heading(self, builder, text):
 		'''Parse heading and determine it's level'''
 		assert text.startswith('=')
 		for i, c in enumerate(text):
@@ -195,9 +302,12 @@ class WikiParser(object):
 			# === is level 4
 			# ...
 			# ======= is level 1
-
 		text = text[i:].lstrip() + '\n'
-		builder.append(HEADING, {'level': level}, text)
+
+		builder.start(HEADING, {'level': level})
+		self.inline_parser(builder, text)
+		builder.end(HEADING)
+
 
 	@staticmethod
 	def parse_pre(builder, indent, text):
@@ -342,7 +452,7 @@ class WikiParser(object):
 					pass
 				elif block.isspace():
 					builder.text(block)
-				elif self.backward \
+				elif self.backward_indented_blocks \
 				and not unindented_line_re.search(block):
 					# Before zim 0.29 all indented paragraphs were
 					# verbatim.
@@ -424,19 +534,28 @@ class WikiParser(object):
 		self.inline_parser(builder, text)
 		builder.end(BLOCK)
 
-	@staticmethod
-	def parse_link(builder, text):
+	def parse_link(self, builder, text):
 		text = text.strip('|') # old bug producing "[[|link]]", or "[[link|]]" or "[[||]]"
+		if not text or text.isspace():
+			return
+
+		href = None
 		if '|' in text:
 			href, text = text.split('|', 1)
 			text = text.strip('|') # stuff like "[[foo||bar]]"
-		else:
-			href = text
 
-		if href and not href.isspace():
-			builder.append(LINK, {'href': href}, text)
+		if text.endswith(']'):
+			delta = text.count(']') - text.count('[')
+			if delta > 0:
+				self.inline_parser.backup_parser_offset(delta)
+				text = text[:-delta]
+
+		if href is None:
+			builder.append(LINK, {'href': text}, text)
 		else:
-			pass
+			builder.start(LINK, {'href': href})
+			self.nested_inline_parser(builder, text)
+			builder.end(LINK)
 
 	@staticmethod
 	def parse_image(builder, text):
@@ -456,9 +575,17 @@ class WikiParser(object):
 		else:
 			builder.append(IMAGE, attrib)
 
-	@staticmethod
-	def parse_url(builder, text):
-		builder.append(LINK, {'href': text}, text)
+	def parse_url(self, builder, *a):
+		text = a[0]
+		if self.backward_url_parsing:
+			builder.append(LINK, {'href': text}, text)
+		else:
+			url = match_url(text)
+			if url is None:
+				self.inline_parser.backup_parser_offset(len(text) - 1)
+			elif url != text:
+				self.inline_parser.backup_parser_offset(len(text) - len(url))
+			builder.append(LINK, {'href': url}, url)
 
 	@staticmethod
 	def parse_tag(builder, text):
@@ -477,7 +604,7 @@ wikiparser = WikiParser() #: singleton instance
 class Parser(ParserClass):
 
 	def __init__(self, version=WIKI_FORMAT_VERSION):
-		self.backward = version not in ('zim 0.26', WIKI_FORMAT_VERSION)
+		self.version = version
 
 	def parse(self, input, partial=False, file_input=False):
 		if not isinstance(input, str):
@@ -486,16 +613,22 @@ class Parser(ParserClass):
 		if not partial:
 			input = fix_line_end(input)
 
-		meta, backward = None, False
+		meta, version = None, False
 		if file_input:
 			input, meta = parse_header_lines(input)
 			version = meta.get('Wiki-Format')
-			if version and version not in ('zim 0.26', WIKI_FORMAT_VERSION):
-				backward = True
+
+		# Support backward compatibility - see history notes WIKI_FORMAT_VERSION
+		version = version or self.version
+		if version == 'zim 0.6':
+			mywikiparser = wikiparser
+		elif version in ('zim 0.4', 'zim 0.5'):
+			mywikiparser = WikiParser(backward_url_parsing=True)
+		else:
+			mywikiparser = WikiParser(backward_indented_blocks=True, backward_url_parsing=True)
 
 		builder = ParseTreeBuilder(partial=partial)
-		wikiparser.backward = backward or self.backward # HACK
-		wikiparser(builder, input)
+		mywikiparser(builder, input)
 
 		parsetree = builder.get_parsetree()
 		if meta is not None:
@@ -569,7 +702,7 @@ class Dumper(TextDumper):
 		href = attrib['href']
 
 		if not strings or href == ''.join(strings):
-			if url_re.match(href):
+			if is_url(href):
 				return (href,) # no markup needed
 			else:
 				return ('[[', href, ']]')
